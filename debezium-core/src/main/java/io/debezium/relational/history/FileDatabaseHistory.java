@@ -25,14 +25,12 @@ import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.document.DocumentReader;
 import io.debezium.document.DocumentWriter;
-import io.debezium.relational.Tables;
-import io.debezium.relational.ddl.DdlParser;
 import io.debezium.util.Collect;
 import io.debezium.util.FunctionalReadWriteLock;
 
 /**
  * A {@link DatabaseHistory} implementation that stores the schema history in a local file.
- * 
+ *
  * @author Randall Hauch
  */
 @ThreadSafe
@@ -124,10 +122,10 @@ public final class FileDatabaseHistory extends AbstractDatabaseHistory {
     }
 
     @Override
-    protected synchronized void recoverRecords(Tables schema, DdlParser ddlParser, Consumer<HistoryRecord> records) {
+    protected synchronized void recoverRecords(Consumer<HistoryRecord> records) {
         lock.write(() -> {
             try {
-                if (Files.exists(path)) {
+                if (exists()) {
                     for (String line : Files.readAllLines(path, UTF8)) {
                         if (line != null && !line.isEmpty()) {
                             records.accept(new HistoryRecord(reader.read(line)));
@@ -138,6 +136,11 @@ public final class FileDatabaseHistory extends AbstractDatabaseHistory {
                 logger.error("Failed to add recover records from history at {}", path, e);
             }
         });
+    }
+    
+    @Override
+    public boolean exists() {
+        return Files.exists(path);
     }
 
     @Override

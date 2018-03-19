@@ -23,7 +23,7 @@ POSTGRES_DECODER_DIR = 'postgres-decoder'
 
 VERSION_TAG = "v$RELEASE_VERSION"
 CONNECTORS = ['mongodb','mysql','postgres']
-IMAGES = ['connect', 'connect-base', 'examples/mysql', 'examples/mysql-gtids', 'kafka', 'zookeeper']
+IMAGES = ['connect', 'connect-base', 'examples/mysql', 'examples/mysql-gtids', 'examples/postgres', 'examples/mongodb', 'kafka', 'zookeeper']
 MAVEN_CENTRAL = 'https://repo1.maven.org/maven2'
 STAGING_REPO = 'https://oss.sonatype.org/content/repositories'
 STAGING_REPO_ID = null
@@ -36,7 +36,7 @@ withCredentials([usernamePassword(credentialsId: JIRA_CREDENTIALS_ID, passwordVa
 }
 
 JIRA_PROJECT = 'DBZ'
-JIRA_VERSION = RELEASE_VERSION - '.0'
+JIRA_VERSION = RELEASE_VERSION
 
 JIRA_CLOSE_ISSUE = """
     {
@@ -112,12 +112,20 @@ def unresolvedIssuesFromJira() {
 }
 
 @NonCPS
+def issuesWithoutComponentsFromJira() {
+    jiraGET('search', [
+        'jql': "project=$JIRA_PROJECT AND fixVersion=$JIRA_VERSION AND component IS EMPTY",
+        'fields': 'key'
+    ]).issues.collect { it.key }
+}
+
+@NonCPS
 def closeJiraIssues() {
     def resolvedIssues = jiraGET('search', [
         'jql': "project=$JIRA_PROJECT AND fixVersion=$JIRA_VERSION AND status='Resolved'",
         'fields': 'key'
     ]).issues.collect { it.self }
-    
+
     resolvedIssues.each { issue -> jiraUpdate("${issue}/transitions", JIRA_CLOSE_ISSUE) }
 }
 
@@ -163,13 +171,17 @@ node('Slave') {
 
     stage ('Check Jira') {
         unresolvedIssues = unresolvedIssuesFromJira()
+        issuesWithoutComponents = issuesWithoutComponentsFromJira()
         if (unresolvedIssues) {
             error "Error, issues ${unresolvedIssues.toString()} must be resolved"
+        }
+        if (issuesWithoutComponents) {
+            error "Error, issues ${issuesWithoutComponents.toString()} must have component set"
         }
     }
 
     stage ('Check changelog') {
-        if (!new URL('https://raw.githubusercontent.com/debezium/debezium/$DEBEZIUM_BRANCH/CHANGELOG.md').text.contains(RELEASE_VERSION) ||
+        if (!new URL("https://raw.githubusercontent.com/debezium/debezium/$DEBEZIUM_BRANCH/CHANGELOG.md").text.contains(RELEASE_VERSION) ||
             !new URL('https://raw.githubusercontent.com/debezium/debezium.github.io/develop/docs/releases.asciidoc').text.contains(RELEASE_VERSION)
         ) {
             error 'Changelog was not modified to include release information'
@@ -252,9 +264,9 @@ node('Slave') {
             sleep 10
             docker run -it -d --name kafka -p 9092:9092 --link zookeeper:zookeeper debezium/kafka:$IMAGE_TAG
             sleep 10
-            docker run -it -d --name connect -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my_connect_configs -e OFFSET_STORAGE_TOPIC=my_connect_offsets --link zookeeper:zookeeper --link kafka:kafka --link mysql:mysql debezium/connect:0.5
+            docker run -it -d --name connect -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my_connect_configs -e OFFSET_STORAGE_TOPIC=my_connect_offsets --link zookeeper:zookeeper --link kafka:kafka --link mysql:mysql debezium/connect:$IMAGE_TAG
             sleep 30
-            
+
             curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" localhost:8083/connectors/ -d '
             {
                 "name": "inventory-connector",
@@ -277,7 +289,7 @@ node('Slave') {
             sleep 10
         """
         timeout (time: 2, unit: java.util.concurrent.TimeUnit.MINUTES) {
-            def watcherlog = sh(script: 'docker run --name watcher --rm --link zookeeper:zookeeper debezium/kafka:0.5 watch-topic -a -k dbserver1.inventory.customers --max-messages 2 2>&1', returnStdout: true).trim()
+            def watcherlog = sh(script: "docker run --name watcher --rm --link zookeeper:zookeeper debezium/kafka:$IMAGE_TAG watch-topic -a -k dbserver1.inventory.customers --max-messages 2 2>&1", returnStdout: true).trim()
             echo watcherlog
             sh 'docker rm -f connect zookeeper kafka mysql'
             if (!watcherlog.contains('Processed a total of 2 messages')) {
@@ -298,9 +310,15 @@ node('Slave') {
     }
 
     stage ('Push to Central') {
-//      TODO: Publish staging repo
+        echo '================================================================================='
+        echo '|                                                                               |'
+        echo '|                                                                               |'
+        echo '|          Log in into the OSS Central and release the staging repo"            |'
+        echo '|                                                                               |'
+        echo '|                                                                               |'
+        echo '================================================================================='
     }
-    
+
     stage ('Wait for Central sync') {
         timeout (time: 2, unit: java.util.concurrent.TimeUnit.HOURS) {
             while (true) {
@@ -336,6 +354,9 @@ node('Slave') {
         }
         dir ("$IMAGES_DIR") {
             modifyFile('postgres/9.6/Dockerfile') {
+                it.replaceFirst('PLUGIN_VERSION=\\S+', "PLUGIN_VERSION=$VERSION_TAG")
+            }
+            modifyFile('postgres/10.0/Dockerfile') {
                 it.replaceFirst('PLUGIN_VERSION=\\S+', "PLUGIN_VERSION=$VERSION_TAG")
             }
         }

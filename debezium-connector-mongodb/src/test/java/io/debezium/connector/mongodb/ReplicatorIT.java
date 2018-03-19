@@ -5,6 +5,8 @@
  */
 package io.debezium.connector.mongodb;
 
+import static org.fest.assertions.Assertions.assertThat;
+
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
@@ -25,8 +27,7 @@ import com.mongodb.client.MongoCursor;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.InsertOneOptions;
-
-import static org.fest.assertions.Assertions.assertThat;
+import com.mongodb.util.JSON;
 
 import io.debezium.data.Envelope.Operation;
 import io.debezium.data.VerifyRecord;
@@ -37,12 +38,13 @@ public class ReplicatorIT extends AbstractMongoIT {
     @Test
     public void shouldReplicateContent() throws InterruptedException {
         Testing.Print.disable();
-
         // Update the configuration to add a collection filter ...
         useConfiguration(config.edit()
                                .with(MongoDbConnectorConfig.MAX_FAILED_CONNECTIONS, 1)
                                .with(MongoDbConnectorConfig.COLLECTION_WHITELIST, "dbA.contacts")
                                .build());
+
+        TestHelper.cleanDatabase(primary, "dbA");
 
         // ------------------------------------------------------------------------------
         // ADD A DOCUMENT
@@ -70,7 +72,7 @@ public class ReplicatorIT extends AbstractMongoIT {
 
         // Start the replicator ...
         List<SourceRecord> records = new LinkedList<>();
-        Replicator replicator = new Replicator(context, replicaSet, records::add);
+        Replicator replicator = new Replicator(context, replicaSet, records::add, (x) -> {});
         Thread thread = new Thread(replicator::run);
         thread.start();
 
@@ -138,7 +140,7 @@ public class ReplicatorIT extends AbstractMongoIT {
 
         // Start the replicator again ...
         records = new LinkedList<>();
-        replicator = new Replicator(context, replicaSet, records::add);
+        replicator = new Replicator(context, replicaSet, records::add, (x) ->  {});
         thread = new Thread(replicator::run);
         thread.start();
 
@@ -164,7 +166,7 @@ public class ReplicatorIT extends AbstractMongoIT {
 
         // Start the replicator again ...
         records = new LinkedList<>();
-        replicator = new Replicator(context, replicaSet, records::add);
+        replicator = new Replicator(context, replicaSet, records::add, (x) ->  {});
         thread = new Thread(replicator::run);
         thread.start();
 
@@ -208,7 +210,7 @@ public class ReplicatorIT extends AbstractMongoIT {
         records.forEach(record -> {
             VerifyRecord.isValid(record);
             Struct key = (Struct) record.key();
-            ObjectId id = new ObjectId(key.getString("_id"));
+            ObjectId id = (ObjectId)(JSON.parse(key.getString("id")));
             foundIds.add(id);
             if (record.value() != null) {
                 Struct value = (Struct) record.value();
@@ -226,7 +228,7 @@ public class ReplicatorIT extends AbstractMongoIT {
 
         // Start the replicator again ...
         records = new LinkedList<>();
-        replicator = new Replicator(context, replicaSet, records::add);
+        replicator = new Replicator(context, replicaSet, records::add, (x) ->  {});
         thread = new Thread(replicator::run);
         thread.start();
 

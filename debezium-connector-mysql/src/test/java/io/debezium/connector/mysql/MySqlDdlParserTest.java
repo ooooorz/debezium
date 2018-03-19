@@ -13,6 +13,7 @@ import java.io.InputStream;
 import java.sql.Types;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -132,6 +133,33 @@ public class MySqlDdlParserTest {
         assertColumn(foo, "phone_number", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
 
         parser.parse("DROP TABLE shop", tables);
+        assertThat(tables.size()).isEqualTo(0);
+    }
+
+    @Test
+    @FixFor("DBZ-474")
+    public void shouldParseCreateTableStatementWithCollate() {
+        String ddl = "CREATE TABLE c1 (pk INT PRIMARY KEY, v1 CHAR(36) NOT NULL COLLATE utf8_unicode_ci);";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table table = tables.forTable(new TableId(null, null, "c1"));
+        assertThat(table).isNotNull();
+        assertColumn(table, "v1", "CHAR", Types.CHAR, 36, -1, false, false, false);
+        Column column = table.columnWithName("v1");
+        assertThat(column.typeUsesCharset()).isTrue();
+    }
+    
+    @Test
+    @FixFor("DBZ-646")
+    public void shouldParseTokuDBTable() {
+        String ddl = "CREATE TABLE foo ( " + System.lineSeparator()
+                + " c1 INTEGER NOT NULL, " + System.lineSeparator()
+                + " c2 VARCHAR(22) " + System.lineSeparator()
+                + ") engine=TokuDB `compression`=tokudb_zlib;";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        listener.assertNext().createTableNamed("foo").ddlStartsWith("CREATE TABLE foo (");
+        parser.parse("DROP TABLE foo", tables);
         assertThat(tables.size()).isEqualTo(0);
     }
 
@@ -449,6 +477,33 @@ public class MySqlDdlParserTest {
         assertThat(t3.columnWithName("col3").position()).isEqualTo(2);
         assertThat(t3.columnWithName("col2").position()).isEqualTo(3);
     }
+
+    @FixFor("DBZ-660")
+    @Test
+    public void shouldParseAlterTableStatementAddConstraintUniqueKey() {
+        String ddl = "CREATE TABLE t ( col1 VARCHAR(25) ); ";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+
+        ddl = "ALTER TABLE t ADD CONSTRAINT UNIQUE KEY col_key ('col1');";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE t ADD CONSTRAINT UNIQUE KEY ('col1');";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE t ADD UNIQUE KEY col_key ('col1');";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE t ADD UNIQUE KEY ('col1');";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE t ADD CONSTRAINT 'xx' UNIQUE KEY col_key ('col1');";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE t ADD CONSTRAINT 'xx' UNIQUE KEY ('col1');";
+        parser.parse(ddl, tables);
+    }
+
 
     @Test
     public void shouldParseCreateTableWithEnumAndSetColumns() {
@@ -823,6 +878,22 @@ public class MySqlDdlParserTest {
         assertThat(tables.size()).isEqualTo(0);
     }
 
+    @FixFor("DBZ-415")
+    @Test
+    public void shouldParseProcedureEmbeddedIfs() {
+        parser.parse(readFile("ddl/mysql-dbz-415a.ddl"), tables);
+        Testing.print(tables);
+        assertThat(tables.size()).isEqualTo(0);
+    }
+
+    @FixFor("DBZ-415")
+    @Test
+    public void shouldParseProcedureIfWithParenthesisStart() {
+        parser.parse(readFile("ddl/mysql-dbz-415b.ddl"), tables);
+        Testing.print(tables);
+        assertThat(tables.size()).isEqualTo(0);
+    }
+
     @FixFor("DBZ-198")
     @Test
     public void shouldParseButIgnoreCreateFunctionWithDefiner() {
@@ -912,6 +983,16 @@ public class MySqlDdlParserTest {
         listener.forEach(this::printEvent);
         assertThat(tables.size()).isEqualTo(1);
         assertThat(listener.total()).isEqualTo(2);
+    }
+
+    @FixFor("DBZ-437")
+    @Test
+    public void shouldParseStringSameAsKeyword() {
+        parser.parse(readFile("ddl/mysql-dbz-437.ddl"), tables);
+//        Testing.Print.enable();
+        listener.forEach(this::printEvent);
+        assertThat(tables.size()).isEqualTo(0);
+        assertThat(listener.total()).isEqualTo(0);
     }
 
     @FixFor("DBZ-200")
@@ -1008,6 +1089,15 @@ public class MySqlDdlParserTest {
     }
 
     @Test
+    @FixFor("DBZ-476")
+    public void shouldParseEscapedEnumOptions() {
+        assertParseEnumAndSetOptions("ENUM('a''','b','c')", "a'',b,c");
+        assertParseEnumAndSetOptions("ENUM('a\\'','b','c')", "a\\',b,c");
+        assertParseEnumAndSetOptions("ENUM(\"a\\\"\",'b','c')", "a\\\",b,c");
+        assertParseEnumAndSetOptions("ENUM(\"a\"\"\",'b','c')", "a\"\",b,c");
+    }
+
+   @Test
     public void shouldParseSetOptions() {
         assertParseEnumAndSetOptions("SET('a','b','c')", "a,b,c");
         assertParseEnumAndSetOptions("SET('a','multi','multi with () paren', 'other')", "a,multi,multi with () paren,other");
@@ -1084,6 +1174,21 @@ public class MySqlDdlParserTest {
         assertThat(listener.total()).isEqualTo(2);
     }
 
+    @FixFor("DBZ-419")
+    @Test
+    public void shouldParseCreateTableWithUnnamedPrimaryKeyConstraint() {
+        final String ddl =
+                "CREATE TABLE IF NOT EXISTS tables_exception (table_name VARCHAR(100), create_date TIMESTAMP DEFAULT NOW(), enabled INT(1), retention int(1) default 30, CONSTRAINT PRIMARY KEY (table_name));";
+
+        parser.parse(ddl, tables);
+        Testing.print(tables);
+
+        Table t = tables.forTable(new TableId(null, null, "tables_exception"));
+        assertThat(t).isNotNull();
+        assertThat(t.primaryKeyColumnNames()).containsExactly("table_name");
+        assertThat(tables.size()).isEqualTo(1);
+    }
+
     @Test
     public void shouldParseStatementForDbz142() {
         parser.parse(readFile("ddl/mysql-dbz-142.ddl"), tables);
@@ -1101,6 +1206,285 @@ public class MySqlDdlParserTest {
         Table t2 = tables.forTable(new TableId(null, null, "nchars"));
         assertColumn(t2, "c1", "NATIONAL CHARACTER", Types.NCHAR, 10, "utf8", true);
         assertColumn(t2, "c2", "NCHAR", Types.NCHAR, 10, "utf8", true);
+    }
+
+    @Test
+    @FixFor("DBZ-408")
+    public void shouldParseCreateTableStatementWithColumnNamedColumn() {
+        String ddl = "CREATE TABLE `mytable` ( " + System.lineSeparator()
+                    + " `def` int(11) unsigned NOT NULL AUTO_INCREMENT, " + System.lineSeparator()
+                    + " `ghi` varchar(255) NOT NULL DEFAULT '', " + System.lineSeparator()
+                    + " `column` varchar(255) NOT NULL DEFAULT '', " + System.lineSeparator()
+                    + " PRIMARY KEY (`def`) " + System.lineSeparator()
+                  + " ) ENGINE=InnoDB DEFAULT CHARSET=utf8;";
+
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table mytable = tables.forTable(new TableId(null, null, "mytable"));
+        assertThat(mytable).isNotNull();
+        assertColumn(mytable, "column", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "ghi", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+    }
+
+      @Test
+      @FixFor("DBZ-428")
+      public void shouldParseCreateTableWithTextType() {
+          String ddl = "CREATE TABLE DBZ428 ("
+                        + "limtext TEXT(20), "
+                        + "unltext TEXT);";
+
+          parser.parse(ddl, tables);
+          assertThat(tables.size()).isEqualTo(1);
+          Table mytable = tables.forTable(new TableId(null, null, "DBZ428"));
+          assertThat(mytable).isNotNull();
+          assertColumn(mytable, "unltext", "TEXT", Types.VARCHAR, -1, -1, true, false, false);
+          assertColumn(mytable, "limtext", "TEXT", Types.VARCHAR, 20, -1, true, false, false);
+      }
+
+      @Test
+      @FixFor("DBZ-439")
+      public void shouldParseCreateTableWithDoublePrecisionKeyword() {
+          String ddl = "CREATE TABLE DBZ439 ("
+                        + "limdouble DOUBLE PRECISION(20, 2),"
+                        + "unldouble DOUBLE PRECISION);";
+
+          parser.parse(ddl, tables);
+          assertThat(tables.size()).isEqualTo(1);
+          Table mytable = tables.forTable(new TableId(null, null, "DBZ439"));
+          assertThat(mytable).isNotNull();
+          assertColumn(mytable, "limdouble", "DOUBLE PRECISION", Types.DOUBLE, 20, 2, true, false, false);
+          assertColumn(mytable, "unldouble", "DOUBLE PRECISION", Types.DOUBLE, -1, -1, true, false, false);
+      }
+
+    @Test
+    @FixFor({"DBZ-408", "DBZ-412"})
+    public void shouldParseAlterTableStatementWithColumnNamedColumnWithoutColumnWord() {
+        String ddl = "CREATE TABLE `mytable` ( " + System.lineSeparator()
+                    + " `def` int(11) unsigned NOT NULL AUTO_INCREMENT, " + System.lineSeparator()
+                    + " PRIMARY KEY (`def`) " + System.lineSeparator()
+                  + " ) ENGINE=InnoDB DEFAULT CHARSET=utf8;";
+
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "ADD `column` varchar(255) NOT NULL DEFAULT '', "
+                + "ADD `ghi` varchar(255) NOT NULL DEFAULT '', "
+                + "ADD jkl varchar(255) NOT NULL DEFAULT '' ;";
+
+        parser.parse(ddl, tables);
+
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table mytable = tables.forTable(new TableId(null, null, "mytable"));
+        assertThat(mytable).isNotNull();
+        assertColumn(mytable, "column", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "ghi", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "jkl", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "MODIFY `column` varchar(1023) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "ALTER `column` DROP DEFAULT;";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "CHANGE `column` newcol varchar(1023) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "CHANGE newcol `column` varchar(255) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        assertThat(tables.size()).isEqualTo(1);
+        mytable = tables.forTable(new TableId(null, null, "mytable"));
+        assertThat(mytable).isNotNull();
+        assertColumn(mytable, "column", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "ghi", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "jkl", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "DROP `column`, "
+                + "DROP `ghi`, "
+                + "DROP jkl";
+
+        parser.parse(ddl, tables);
+        mytable = tables.forTable(new TableId(null, null, "mytable"));
+        List<String> mytableColumnNames = mytable.columns()
+            .stream()
+            .map(Column::name)
+            .collect(Collectors.toList());
+
+        assertThat(mytableColumnNames).containsOnly("def");
+    }
+
+    @Test
+    @FixFor({"DBZ-408", "DBZ-412", "DBZ-524"})
+    public void shouldParseAlterTableStatementWithColumnNamedColumnWithColumnWord() {
+        String ddl = "CREATE TABLE `mytable` ( " + System.lineSeparator()
+                    + " `def` int(11) unsigned NOT NULL AUTO_INCREMENT, " + System.lineSeparator()
+                    + " PRIMARY KEY (`def`) " + System.lineSeparator()
+                  + " ) ENGINE=InnoDB DEFAULT CHARSET=utf8;";
+
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "ADD COLUMN `column` varchar(255) NOT NULL DEFAULT '', "
+                + "ADD COLUMN `ghi` varchar(255) NOT NULL DEFAULT '', "
+                + "ADD COLUMN jkl varchar(255) NOT NULL DEFAULT '' ;";
+
+        parser.parse(ddl, tables);
+
+        assertThat(tables.size()).isEqualTo(1);
+
+        Table mytable = tables.forTable(new TableId(null, null, "mytable"));
+        assertThat(mytable).isNotNull();
+        assertColumn(mytable, "column", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "ghi", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "jkl", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "MODIFY COLUMN `column` varchar(1023) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "ALTER COLUMN `column` DROP DEFAULT;";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "CHANGE COLUMN `column` newcol varchar(1023) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "CHANGE COLUMN newcol `column` varchar(255) NOT NULL DEFAULT '';";
+        parser.parse(ddl, tables);
+
+        assertThat(tables.size()).isEqualTo(1);
+        mytable = tables.forTable(new TableId(null, null, "mytable"));
+        assertThat(mytable).isNotNull();
+        assertColumn(mytable, "column", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "ghi", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+        assertColumn(mytable, "jkl", "VARCHAR", Types.VARCHAR, 255, -1, false, false, false);
+
+        ddl = "ALTER TABLE `mytable` "
+                + "DROP COLUMN `column`, "
+                + "DROP COLUMN `ghi`, "
+                + "DROP COLUMN jkl RESTRICT";
+
+        parser.parse(ddl, tables);
+        mytable = tables.forTable(new TableId(null, null, "mytable"));
+        List<String> mytableColumnNames = mytable.columns()
+            .stream()
+            .map(Column::name)
+            .collect(Collectors.toList());
+
+        assertThat(mytableColumnNames).containsOnly("def");
+    }
+
+    @Test
+    @FixFor("DBZ-425")
+    public void shouldParseAlterTableAlterDefaultColumnValue() {
+        String ddl = "CREATE TABLE t ( c1 DEC(2) NOT NULL, c2 FIXED(1,0) NOT NULL);";
+        ddl += "ALTER TABLE t ALTER c1 SET DEFAULT 13;";
+        parser.parse(ddl, tables);
+    }
+
+    @Test
+    public void parseDdlForDecAndFixed() {
+        String ddl = "CREATE TABLE t ( c1 DEC(2) NOT NULL, c2 FIXED(1,0) NOT NULL);";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table t = tables.forTable(new TableId(null, null, "t"));
+        assertThat(t).isNotNull();
+        assertThat(t.columnNames()).containsExactly("c1", "c2");
+        assertThat(t.primaryKeyColumnNames()).isEmpty();
+        assertColumn(t, "c1", "DEC", Types.DECIMAL, 2, 0, false, false, false);
+        assertColumn(t, "c2", "FIXED", Types.DECIMAL, 1, 0, false, false, false);
+    }
+
+    @Test
+    @FixFor("DBZ-615")
+    public void parseDdlForUnscaledDecAndFixed() {
+        String ddl = "CREATE TABLE t ( c1 DEC NOT NULL, c2 FIXED(3) NOT NULL);";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table t = tables.forTable(new TableId(null, null, "t"));
+        assertThat(t).isNotNull();
+        assertThat(t.columnNames()).containsExactly("c1", "c2");
+        assertThat(t.primaryKeyColumnNames()).isEmpty();
+        assertColumn(t, "c1", "DEC", Types.DECIMAL, 10, 0, false, false, false);
+        assertColumn(t, "c2", "FIXED", Types.DECIMAL, 3, 0, false, false, false);
+    }
+
+    @Test
+    public void parseTableWithPageChecksum() {
+        String ddl =
+                "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (`id`)) PAGE_CHECKSUM=1;" +
+                "ALTER TABLE t PAGE_CHECKSUM=0;";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table t = tables.forTable(new TableId(null, null, "t"));
+        assertThat(t).isNotNull();
+        assertThat(t.columnNames()).containsExactly("id");
+        assertThat(t.primaryKeyColumnNames()).hasSize(1);
+        assertColumn(t, "id", "INT", Types.INTEGER, -1, -1, false, false, false);
+    }
+
+    @Test
+    @FixFor("DBZ-429")
+    public void parseTableWithNegativeDefault() {
+        String ddl =
+                "CREATE TABLE t (id INT NOT NULL, myvalue INT DEFAULT -10, PRIMARY KEY (`id`));";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        Table t = tables.forTable(new TableId(null, null, "t"));
+        assertThat(t).isNotNull();
+        assertThat(t.columnNames()).containsExactly("id", "myvalue");
+        assertThat(t.primaryKeyColumnNames()).hasSize(1);
+        assertColumn(t, "myvalue", "INT", Types.INTEGER, -1, -1, true, false, false);
+    }
+
+    @Test
+    @FixFor("DBZ-475")
+    public void parseUserDdlStatements() {
+        String ddl =
+                "CREATE USER 'jeffrey'@'localhost' IDENTIFIED BY 'password';"
+              + "RENAME USER 'jeffrey'@'localhost' TO 'jeff'@'127.0.0.1';"
+              + "DROP USER 'jeffrey'@'localhost';"
+              + "SET PASSWORD FOR 'jeffrey'@'localhost' = 'auth_string';"
+              + "ALTER USER 'jeffrey'@'localhost' IDENTIFIED BY 'new_password' PASSWORD EXPIRE;";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(0);
+    }
+
+    @Test
+    @FixFor("DBZ-530")
+    public void parsePartitionReorganize() {
+        String ddl =
+                "CREATE TABLE flat_view_request_log (id INT NOT NULL, myvalue INT DEFAULT -10, PRIMARY KEY (`id`));"
+              + "ALTER TABLE flat_view_request_log REORGANIZE PARTITION p_max INTO ( PARTITION p_2018_01_17 VALUES LESS THAN ('2018-01-17'), PARTITION p_2018_01_18 VALUES LESS THAN ('2018-01-18'), PARTITION p_max VALUES LESS THAN MAXVALUE);";
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+    }
+
+    @Test
+    @FixFor("DBZ-641")
+    public void parsePartitionWithEngine() {
+        String ddl =
+                "CREATE TABLE flat_view_request_log (" +
+                "  id INT NOT NULL, myvalue INT DEFAULT -10," +
+                "  PRIMARY KEY (`id`)" +
+                ")" +
+                "ENGINE=InnoDB DEFAULT CHARSET=latin1 " +
+                "PARTITION BY RANGE (to_days(`CreationDate`)) " +
+                "(PARTITION p_2018_01_17 VALUES LESS THAN ('2018-01-17') ENGINE = InnoDB, " +
+                "PARTITION p_2018_01_18 VALUES LESS THAN ('2018-01-18') ENGINE = InnoDB, " +
+                "PARTITION p_max VALUES LESS THAN MAXVALUE ENGINE = InnoDB);";
+
+        parser.parse(ddl, tables);
+        assertThat(tables.size()).isEqualTo(1);
+        assertThat(tables.forTable(new TableId(null, null, "flat_view_request_log"))).isNotNull();
     }
 
     protected void assertParseEnumAndSetOptions(String typeExpression, String optionString) {

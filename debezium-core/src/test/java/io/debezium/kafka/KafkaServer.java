@@ -93,7 +93,7 @@ public class KafkaServer {
      */
     protected void populateDefaultConfiguration(Properties props) {
         config.setProperty(KafkaConfig.NumPartitionsProp(), String.valueOf(1));
-        config.setProperty(KafkaConfig.LogFlushIntervalMessagesProp(), String.valueOf(1));
+        config.setProperty(KafkaConfig.LogFlushIntervalMessagesProp(), String.valueOf(Long.MAX_VALUE));
     }
 
     /**
@@ -151,13 +151,16 @@ public class KafkaServer {
      * @return the properties for the currently-running server; may be empty if not running
      */
     public Properties config() {
-        Properties runningConfig = new Properties(config);
+        Properties runningConfig = new Properties();
+        runningConfig.putAll(config);
         runningConfig.setProperty(KafkaConfig.ZkConnectProp(), zookeeperConnection());
         runningConfig.setProperty(KafkaConfig.BrokerIdProp(), Integer.toString(brokerId));
         runningConfig.setProperty(KafkaConfig.HostNameProp(), "localhost");
         runningConfig.setProperty(KafkaConfig.AutoCreateTopicsEnableProp(), String.valueOf(config.getOrDefault(KafkaConfig.AutoCreateTopicsEnableProp(), Boolean.TRUE)));
         // 1 partition for the __consumer_offsets_ topic should be enough
         runningConfig.setProperty(KafkaConfig.OffsetsTopicPartitionsProp(), Integer.toString(1));
+        // Disable delay during every re-balance
+        runningConfig.setProperty(KafkaConfig.GroupInitialRebalanceDelayMsProp(), Integer.toString(0));
         return runningConfig;
     }
 

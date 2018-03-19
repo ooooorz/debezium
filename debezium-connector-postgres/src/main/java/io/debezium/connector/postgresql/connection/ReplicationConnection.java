@@ -13,6 +13,8 @@ import org.postgresql.replication.PGReplicationStream;
 
 import io.debezium.annotation.NotThreadSafe;
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.connector.postgresql.TypeRegistry;
 
 /**
  * A Postgres logical streaming replication connection. Replication connections are established for a slot and a given plugin
@@ -88,7 +90,6 @@ public interface ReplicationConnection extends AutoCloseable {
          * Default replication settings
          */
         String DEFAULT_SLOT_NAME = "debezium";
-        String DEFAULT_PLUGIN_NAME = "decoderbufs";
         boolean DEFAULT_DROP_SLOT_ON_CLOSE = true;
 
         /**
@@ -101,13 +102,13 @@ public interface ReplicationConnection extends AutoCloseable {
         Builder withSlot(final String slotName);
 
         /**
-         * Sets the name for the PG logical decoding plugin
+         * Sets the instance for the PG logical decoding plugin
          *
          * @param pluginName the name of the slot, may not be null.
          * @return this instance
-         * @see #DEFAULT_PLUGIN_NAME
+         * @see #PROTOBUF_PLUGIN_NAME
          */
-        Builder withPlugin(final String pluginName);
+        Builder withPlugin(final PostgresConnectorConfig.LogicalDecoder plugin);
 
         /**
          * Whether or not to drop the replication slot once the replication connection closes
@@ -125,6 +126,8 @@ public interface ReplicationConnection extends AutoCloseable {
          * @return this instance
          */
         Builder statusUpdateIntervalMillis(final Integer statusUpdateIntervalMillis);
+
+        Builder withTypeRegistry(TypeRegistry typeRegistry);
 
         /**
          * Creates a new {@link ReplicationConnection} instance

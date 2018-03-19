@@ -12,11 +12,11 @@ import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 import org.apache.kafka.connect.errors.ConnectException;
@@ -42,11 +42,12 @@ import io.debezium.function.BlockingConsumer;
 import io.debezium.function.BufferedBlockingConsumer;
 import io.debezium.util.Clock;
 import io.debezium.util.Strings;
+import io.debezium.util.Threads;
 
 /**
  * A component that replicates the content of a replica set, starting with an initial sync or continuing to read the oplog where
  * it last left off.
- * 
+ *
  * <h2>Initial Sync</h2>
  * If no offsets have been recorded for this replica set, replication begins with an
  * <a href="https://docs.mongodb.com/manual/core/replica-set-sync/#initial-sync">MongoDB initial sync</a> of the replica set.
@@ -68,26 +69,26 @@ import io.debezium.util.Strings;
  * oplog is <a href="https://docs.mongodb.com/manual/core/replica-set-oplog/">idempotent</a>. So, as long as we read the oplog
  * from the same point in time (or earlier) than we <em>started</em> our copy operation, and apply <em>all</em> of the changes
  * <em>in the same order</em>, then the state of all documents described by this connector will be the same.
- * 
+ *
  * <h2>Restart</h2>
- * If prior runs of the replicator have recorded offsets in the {@link ReplicationContext#source() source information}, then
+ * If prior runs of the replicator have recorded offsets in the {@link MongoDbTaskContext#source() source information}, then
  * when the replicator starts it will simply start reading the primary's oplog starting at the same point it last left off.
- * 
+ *
  * <h2>Handling problems</h2>
  * <p>
  * This replicator does each of its tasks using a connection to the primary. If the replicator is not able to establish a
  * connection to the primary (e.g., there is no primary, or the replicator cannot communicate with the primary), the replicator
  * will continue to try to establish a connection, using an exponential back-off strategy to prevent saturating the system.
- * After a {@link ReplicationContext#maxConnectionAttemptsForPrimary() configurable} number of failed attempts, the replicator
+ * After a {@link MongoDbTaskContext#maxConnectionAttemptsForPrimary() configurable} number of failed attempts, the replicator
  * will fail by throwing a {@link ConnectException}.
- * 
+ *
  * @author Randall Hauch
  */
 @ThreadSafe
 public class Replicator {
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
-    private final ReplicationContext context;
+    private final MongoDbTaskContext context;
     private final ExecutorService copyThreads;
     private final ReplicaSet replicaSet;
     private final String rsName;
@@ -98,14 +99,16 @@ public class Replicator {
     private final Predicate<CollectionId> collectionFilter;
     private final Predicate<String> databaseFilter;
     private final Clock clock;
-    private ReplicationContext.MongoPrimary primaryClient;
+    private ConnectionContext.MongoPrimary primaryClient;
+    private final Consumer<Throwable> onFailure;
 
     /**
      * @param context the replication context; may not be null
      * @param replicaSet the replica set to be replicated; may not be null
      * @param recorder the recorder for source record produced by this replicator; may not be null
+     * @param onFailure listener of exceptions thrown by replicator task
      */
-    public Replicator(ReplicationContext context, ReplicaSet replicaSet, BlockingConsumer<SourceRecord> recorder) {
+    public Replicator(MongoDbTaskContext context, ReplicaSet replicaSet, BlockingConsumer<SourceRecord> recorder, Consumer<Throwable> onFailure) {
         assert context != null;
         assert replicaSet != null;
         assert recorder != null;
@@ -113,12 +116,14 @@ public class Replicator {
         this.source = context.source();
         this.replicaSet = replicaSet;
         this.rsName = replicaSet.replicaSetName();
-        this.copyThreads = Executors.newFixedThreadPool(context.maxNumberOfCopyThreads());
+        final String copyThreadName = "copy-" + (replicaSet.hasReplicaSetName() ? replicaSet.replicaSetName() : "main");
+        this.copyThreads = Threads.newFixedThreadPool(MongoDbConnector.class, context.serverName(), copyThreadName, context.getConnectionContext().maxNumberOfCopyThreads());
         this.bufferedRecorder = new BufferableRecorder(recorder);
-        this.recordMakers = new RecordMakers(this.source, context.topicSelector(), this.bufferedRecorder);
+        this.recordMakers = new RecordMakers(this.source, context.topicSelector(), this.bufferedRecorder, context.isEmitTombstoneOnDelete());
         this.collectionFilter = this.context.collectionFilter();
         this.databaseFilter = this.context.databaseFilter();
-        this.clock = this.context.clock();
+        this.clock = this.context.getClock();
+        this.onFailure = onFailure;
     }
 
     /**
@@ -145,7 +150,12 @@ public class Replicator {
                     }
                     readOplog();
                 }
-            } finally {
+            }
+            catch (Throwable t) {
+                logger.error("Replicator for replica set {} failed", rsName, t);
+                onFailure.accept(t);
+            }
+            finally {
                 this.running.set(false);
             }
         }
@@ -153,12 +163,12 @@ public class Replicator {
 
     /**
      * Establish a connection to the primary.
-     * 
+     *
      * @return {@code true} if a connection was established, or {@code false} otherwise
      */
     protected boolean establishConnectionToPrimary() {
         logger.info("Connecting to '{}'", replicaSet);
-        primaryClient = context.primaryFor(replicaSet, (desc, error) -> {
+        primaryClient = context.getConnectionContext().primaryFor(replicaSet, (desc, error) -> {
             logger.error("Error while attempting to {}: {}", desc, error.getMessage(), error);
         });
         return primaryClient != null;
@@ -177,9 +187,9 @@ public class Replicator {
 
     /**
      * Determine if an initial sync should be performed. An initial sync is expected if the {@link #source} has no previously
-     * recorded offsets for this replica set, or if {@link ReplicationContext#performSnapshotEvenIfNotNeeded() a snapshot should
+     * recorded offsets for this replica set, or if {@link MongoDbTaskContext#performSnapshotEvenIfNotNeeded() a snapshot should
      * always be performed}.
-     * 
+     *
      * @return {@code true} if the initial sync should be performed, or {@code false} otherwise
      */
     protected boolean isInitialSyncExpected() {
@@ -187,7 +197,7 @@ public class Replicator {
         if (source.hasOffset(rsName)) {
             logger.info("Found existing offset for replica set '{}' at {}", rsName, source.lastOffset(rsName));
             performSnapshot = false;
-            if (context.performSnapshotEvenIfNotNeeded()) {
+            if (context.getConnectionContext().performSnapshotEvenIfNotNeeded()) {
                 logger.info("Configured to performing initial sync of replica set '{}'", rsName);
                 performSnapshot = true;
             } else {
@@ -230,7 +240,7 @@ public class Replicator {
 
     /**
      * Perform the initial sync of the collections in the replica set.
-     * 
+     *
      * @return {@code true} if the initial sync was completed, or {@code false} if it was stopped for any reason
      */
     protected boolean performInitialSync() {
@@ -255,7 +265,7 @@ public class Replicator {
             if (databaseFilter.test(id.dbName()) && collectionFilter.test(id))collections.add(id);
         });
         final Queue<CollectionId> collectionsToCopy = new ConcurrentLinkedQueue<>(collections);
-        final int numThreads = Math.min(collections.size(), context.maxNumberOfCopyThreads());
+        final int numThreads = Math.min(collections.size(), context.getConnectionContext().maxNumberOfCopyThreads());
         final CountDownLatch latch = new CountDownLatch(numThreads);
         final AtomicBoolean aborted = new AtomicBoolean(false);
         final AtomicInteger replicatorThreadCounter = new AtomicInteger(0);
@@ -296,6 +306,7 @@ public class Replicator {
             Thread.interrupted();
             aborted.set(true);
         }
+        this.copyThreads.shutdown();
 
         // Stopping the replicator does not interrupt *our* thread but does interrupt the copy threads.
         // Therefore, check the aborted state here ...
@@ -324,7 +335,7 @@ public class Replicator {
 
     /**
      * Copy the collection, sending to the recorder a record for each document.
-     * 
+     *
      * @param collectionId the identifier of the collection to be copied; may not be null
      * @param timestamp the timestamp in milliseconds at which the copy operation was started
      * @return number of documents that were copied
@@ -340,7 +351,7 @@ public class Replicator {
 
     /**
      * Copy the collection, sending to the recorder a record for each document.
-     * 
+     *
      * @param primary the connection to the replica set's primary node; may not be null
      * @param collectionId the identifier of the collection to be copied; may not be null
      * @param timestamp the timestamp in milliseconds at which the copy operation was started
@@ -374,7 +385,7 @@ public class Replicator {
 
     /**
      * Use the given primary to read the oplog.
-     * 
+     *
      * @param primary the connection to the replica set's primary node; may not be null
      */
     protected void readOplog(MongoClient primary) {
@@ -404,7 +415,7 @@ public class Replicator {
 
     /**
      * Handle a single oplog event.
-     * 
+     *
      * @param primaryAddress the address of the primary server from which the event was obtained; may not be null
      * @param event the oplog event; may not be null
      * @return {@code true} if additional events should be processed, or {@code false} if the caller should stop
@@ -484,23 +495,22 @@ public class Replicator {
      */
     protected final class BufferableRecorder implements BlockingConsumer<SourceRecord> {
         private final BlockingConsumer<SourceRecord> actual;
-        private final BufferedBlockingConsumer<SourceRecord> buffered;
+        private BufferedBlockingConsumer<SourceRecord> buffered;
         private volatile BlockingConsumer<SourceRecord> current;
 
         public BufferableRecorder(BlockingConsumer<SourceRecord> actual) {
             this.actual = actual;
-            this.buffered = BufferedBlockingConsumer.bufferLast(actual);
             this.current = this.actual;
         }
 
         /**
          * Start buffering the most recently source record so it can be updated before the {@link #stopBuffering(Map) initial sync
          * is completed}.
-         * 
+         *
          * @throws InterruptedException if the thread is interrupted while waiting for any existing record to be flushed
          */
         protected synchronized void startBuffering() throws InterruptedException {
-            this.buffered.flush();
+            this.buffered = BufferedBlockingConsumer.bufferLast(actual);
             this.current = this.buffered;
         }
 
@@ -508,13 +518,13 @@ public class Replicator {
          * Stop buffering source records, and flush any buffered records by replacing their offset with the provided offset.
          * Note that this only replaces the record's {@link SourceRecord#sourceOffset() offset} and does not change the
          * value of the record, which may contain information about the snapshot.
-         * 
+         *
          * @param newOffset the offset that reflects that the snapshot has been completed; may not be null
          * @throws InterruptedException if the thread is interrupted while waiting for the new record to be flushed
          */
         protected synchronized void stopBuffering(Map<String, ?> newOffset) throws InterruptedException {
             assert newOffset != null;
-            this.buffered.flush(record -> {
+            this.buffered.close(record -> {
                 if (record == null) return null;
                 return new SourceRecord(record.sourcePartition(),
                         newOffset,

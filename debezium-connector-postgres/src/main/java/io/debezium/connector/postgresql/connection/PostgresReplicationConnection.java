@@ -9,21 +9,23 @@ package io.debezium.connector.postgresql.connection;
 import java.nio.ByteBuffer;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Arrays;
+import java.sql.SQLWarning;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.PGConnection;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
+import org.postgresql.util.PSQLException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.protobuf.InvalidProtocolBufferException;
-
 import io.debezium.config.Configuration;
-import io.debezium.connector.postgresql.proto.PgProto;
+import io.debezium.connector.postgresql.PostgresConnectorConfig;
+import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.JdbcConnectionException;
 
@@ -37,10 +39,12 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
     private static Logger LOGGER = LoggerFactory.getLogger(PostgresReplicationConnection.class);
 
     private final String slotName;
-    private final String pluginName;
+    private final PostgresConnectorConfig.LogicalDecoder plugin;
     private final boolean dropSlotOnClose;
     private final Configuration originalConfig;
     private final Integer statusUpdateIntervalMillis;
+    private final MessageDecoder messageDecoder;
+    private final TypeRegistry typeRegistry;
 
     private long defaultStartingPos;
 
@@ -49,23 +53,27 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
      *
      * @param config the JDBC configuration for the connection; may not be null
      * @param slotName the name of the DB slot for logical replication; may not be null
-     * @param pluginName the name of the server side plugin used for streaming changes; may not be null;
+     * @param plugin decoder matching the server side plug-in used for streaming changes; may not be null
      * @param dropSlotOnClose whether the replication slot should be dropped once the connection is closed
      * @param statusUpdateIntervalMillis the number of milli-seconds at which the replication connection should periodically send status
+     * @param typeRegistry registry with PostgreSQL types
      * updates to the server
      */
     private PostgresReplicationConnection(Configuration config,
                                          String slotName,
-                                         String pluginName,
+                                         PostgresConnectorConfig.LogicalDecoder plugin,
                                          boolean dropSlotOnClose,
-                                         Integer statusUpdateIntervalMillis) {
+                                         Integer statusUpdateIntervalMillis,
+                                         TypeRegistry typeRegistry) {
         super(config, PostgresConnection.FACTORY, null ,PostgresReplicationConnection::defaultSettings);
 
         this.originalConfig = config;
         this.slotName = slotName;
-        this.pluginName = pluginName;
+        this.plugin = plugin;
         this.dropSlotOnClose = dropSlotOnClose;
         this.statusUpdateIntervalMillis = statusUpdateIntervalMillis;
+        this.messageDecoder = plugin.messageDecoder();
+        this.typeRegistry = typeRegistry;
 
         try {
             initReplicationSlot();
@@ -75,27 +83,28 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
     }
 
     protected void initReplicationSlot() throws SQLException {
+        final String postgresPluginName = plugin.getPostgresPluginName();
         ServerInfo.ReplicationSlot slotInfo;
         try (PostgresConnection connection = new PostgresConnection(originalConfig)) {
-            slotInfo = connection.readReplicationSlotInfo(slotName, pluginName);
+            slotInfo = connection.readReplicationSlotInfo(slotName, postgresPluginName);
         }
 
         boolean shouldCreateSlot = ServerInfo.ReplicationSlot.INVALID == slotInfo;
         try {
             if (shouldCreateSlot) {
-                LOGGER.debug("Creating new replication slot '{}' for plugin '{}'", slotName, pluginName);
+                LOGGER.debug("Creating new replication slot '{}' for plugin '{}'", slotName, plugin);
                 // there's no info for this plugin and slot so create a new slot
                 pgConnection().getReplicationAPI()
                               .createReplicationSlot()
                               .logical()
                               .withSlotName(slotName)
-                              .withOutputPlugin(pluginName)
+                              .withOutputPlugin(postgresPluginName)
                               .make();
             } else if (slotInfo.active()) {
                 LOGGER.error(
                         "A logical replication slot named '{}' for plugin '{}' and database '{}' is already active on the server." +
                         "You cannot have multiple slots with the same name active for the same database",
-                        slotName, pluginName, database());
+                        slotName, postgresPluginName, database());
                 throw new IllegalStateException();
             }
 
@@ -149,6 +158,103 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
     }
 
     private ReplicationStream createReplicationStream(final LogSequenceNumber lsn) throws SQLException {
+        PGReplicationStream s;
+        try {
+            s = startPgReplicationStream(lsn, plugin.forceRds() ? messageDecoder::optionsWithoutMetadata : messageDecoder::optionsWithMetadata);
+            messageDecoder.setContainsMetadata(plugin.forceRds() ? false : true);
+        } catch (PSQLException e) {
+            if (e.getMessage().matches("(?s)ERROR: option .* is unknown.*")) {
+                // It is possible we are connecting to an old wal2json plug-in
+                LOGGER.warn("Could not register for streaming with metadata in messages, falling back to messages without metadata");
+                s = startPgReplicationStream(lsn, messageDecoder::optionsWithoutMetadata);
+                messageDecoder.setContainsMetadata(false);
+            } else if (e.getMessage().matches("(?s)ERROR: requested WAL segment .* has already been removed.*")) {
+                LOGGER.error("Cannot rewind to last processed WAL position", e);
+                throw new ConnectException("The offset to start reading from has been removed from the database write-ahead log. Create a new snapshot and consider setting of PostgreSQL parameter wal_keep_segments = 0.");
+            } else {
+                throw e;
+            }
+        }
+        final PGReplicationStream stream = s;
+        final long lsnLong = lsn.asLong();
+        return new ReplicationStream() {
+            private static final int CHECK_WARNINGS_AFTER_COUNT = 100;
+            private int warningCheckCounter = CHECK_WARNINGS_AFTER_COUNT;
+
+            // make sure this is volatile since multiple threads may be interested in this value
+            private volatile LogSequenceNumber lastReceivedLSN;
+
+            @Override
+            public void read(ReplicationMessageProcessor processor) throws SQLException, InterruptedException {
+                ByteBuffer read = stream.read();
+                // the lsn we started from is inclusive, so we need to avoid sending back the same message twice
+                if (lsnLong >= stream.getLastReceiveLSN().asLong()) {
+                    return;
+                }
+                deserializeMessages(read, processor);
+            }
+
+            @Override
+            public void readPending(ReplicationMessageProcessor processor) throws SQLException, InterruptedException {
+                ByteBuffer read = stream.readPending();
+                // the lsn we started from is inclusive, so we need to avoid sending back the same message twice
+                if (read == null ||  lsnLong >= stream.getLastReceiveLSN().asLong()) {
+                    return;
+                }
+                deserializeMessages(read, processor);
+            }
+
+            private void deserializeMessages(ByteBuffer buffer, ReplicationMessageProcessor processor) throws SQLException, InterruptedException {
+                lastReceivedLSN = stream.getLastReceiveLSN();
+                messageDecoder.processMessage(buffer, processor, typeRegistry);
+            }
+
+            @Override
+            public void close() throws SQLException {
+                processWarnings(true);
+                stream.close();
+            }
+
+            @Override
+            public void flushLastReceivedLsn() throws SQLException {
+                if (lastReceivedLSN == null) {
+                    // nothing to flush yet, since we haven't read anything...
+                    return;
+                }
+
+                doFlushLsn(lastReceivedLSN);
+            }
+
+            @Override
+            public void flushLsn(long lsn) throws SQLException {
+                doFlushLsn(LogSequenceNumber.valueOf(lsn));
+            }
+
+            private void doFlushLsn(LogSequenceNumber lsn) throws SQLException {
+                stream.setFlushedLSN(lsn);
+                stream.setAppliedLSN(lsn);
+
+                stream.forceUpdateStatus();
+            }
+
+            @Override
+            public Long lastReceivedLsn() {
+                return lastReceivedLSN != null ? lastReceivedLSN.asLong() : null;
+            }
+
+            private void processWarnings(final boolean forced) throws SQLException {
+                if (--warningCheckCounter == 0 || forced) {
+                    warningCheckCounter = CHECK_WARNINGS_AFTER_COUNT;
+                    for (SQLWarning w = connection().getWarnings(); w != null; w = w.getNextWarning()) {
+                        LOGGER.debug("Server-side message: '{}', state = {}, code = {}",
+                                w.getMessage(), w.getSQLState(), w.getErrorCode());
+                    }
+                }
+            }
+        };
+    }
+
+    private PGReplicationStream startPgReplicationStream(final LogSequenceNumber lsn, Function<ChainedLogicalStreamBuilder, ChainedLogicalStreamBuilder> configurator) throws SQLException {
         assert lsn != null;
         ChainedLogicalStreamBuilder streamBuilder = pgConnection()
                 .getReplicationAPI()
@@ -156,72 +262,22 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
                 .logical()
                 .withSlotName(slotName)
                 .withStartPosition(lsn);
+        streamBuilder = configurator.apply(streamBuilder);
+
         if (statusUpdateIntervalMillis != null && statusUpdateIntervalMillis > 0) {
             streamBuilder.withStatusInterval(statusUpdateIntervalMillis, TimeUnit.MILLISECONDS);
         }
 
         PGReplicationStream stream = streamBuilder.start();
-        final long lsnLong = lsn.asLong();
-        return new ReplicationStream() {
-            // make sure this is volatile since multiple threads may be interested in this value
-            private volatile LogSequenceNumber lastReceivedLSN;
 
-            @Override
-            public PgProto.RowMessage read() throws SQLException {
-                ByteBuffer read = stream.read();
-                // the lsn we started from is inclusive, so we need to avoid sending back the same message twice
-                if (lsnLong >= stream.getLastReceiveLSN().asLong()) {
-                    return null;
-                }
-                return deserializeMessage(read);
-            }
-
-            @Override
-            public PgProto.RowMessage readPending() throws SQLException {
-                ByteBuffer read = stream.readPending();
-                // the lsn we started from is inclusive, so we need to avoid sending back the same message twice
-                if (read == null ||  lsnLong >= stream.getLastReceiveLSN().asLong()) {
-                    return null;
-                }
-                return deserializeMessage(read);
-            }
-
-            private PgProto.RowMessage deserializeMessage(ByteBuffer buffer) {
-                try {
-                    if (!buffer.hasArray()) {
-                        throw new IllegalStateException(
-                                "Invalid buffer received from PG server during streaming replication");
-                    }
-                    byte[] source = buffer.array();
-                    byte[] content = Arrays.copyOfRange(source, buffer.arrayOffset(), source.length);
-                    lastReceivedLSN = stream.getLastReceiveLSN();
-                    return PgProto.RowMessage.parseFrom(content);
-                } catch (InvalidProtocolBufferException e) {
-                    throw new RuntimeException(e);
-                }
-            }
-
-            @Override
-            public void close() throws SQLException {
-                stream.close();
-            }
-
-            @Override
-            public void flushLSN() throws SQLException {
-                if (lastReceivedLSN == null) {
-                    // nothing to flush yet, since we haven't read anything...
-                    return;
-                }
-                stream.setFlushedLSN(lastReceivedLSN);
-                stream.setAppliedLSN(lastReceivedLSN);
-                stream.forceUpdateStatus();
-            }
-
-            @Override
-            public Long lastReceivedLSN() {
-                return lastReceivedLSN != null ? lastReceivedLSN.asLong() : null;
-            }
-        };
+        // TODO DBZ-508 get rid of this
+        // Needed by tests when connections are opened and closed in a fast sequence
+        try {
+            Thread.sleep(10);
+        } catch (Exception e) {
+        }
+        stream.forceUpdateStatus();
+        return stream;
     }
 
     @Override
@@ -249,11 +305,12 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
 
     protected static class ReplicationConnectionBuilder implements Builder {
 
-        private Configuration config;
+        private final Configuration config;
         private String slotName = DEFAULT_SLOT_NAME;
-        private String pluginName = DEFAULT_PLUGIN_NAME;
+        private PostgresConnectorConfig.LogicalDecoder plugin = PostgresConnectorConfig.LogicalDecoder.DECODERBUFS;
         private boolean dropSlotOnClose = DEFAULT_DROP_SLOT_ON_CLOSE;
         private Integer statusUpdateIntervalMillis;
+        private TypeRegistry typeRegistry;
 
         protected ReplicationConnectionBuilder(Configuration config) {
             assert config != null;
@@ -268,9 +325,9 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
         }
 
         @Override
-        public ReplicationConnectionBuilder withPlugin(final String pluginName) {
-            assert pluginName != null;
-            this.pluginName = pluginName;
+        public ReplicationConnectionBuilder withPlugin(final PostgresConnectorConfig.LogicalDecoder plugin) {
+            assert plugin != null;
+            this.plugin = plugin;
             return this;
         }
 
@@ -288,7 +345,14 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
 
         @Override
         public ReplicationConnection build() {
-            return new PostgresReplicationConnection(config, slotName, pluginName, dropSlotOnClose, statusUpdateIntervalMillis);
+            assert plugin != null : "Decoding plugin name is not set";
+            return new PostgresReplicationConnection(config, slotName, plugin, dropSlotOnClose, statusUpdateIntervalMillis, typeRegistry);
+        }
+
+        @Override
+        public Builder withTypeRegistry(TypeRegistry typeRegistry) {
+            this.typeRegistry = typeRegistry;
+            return this;
         }
     }
 }

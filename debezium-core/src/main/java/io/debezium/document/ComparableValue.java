@@ -156,7 +156,7 @@ final class ComparableValue implements Value {
         if (value instanceof Integer) return (Integer) value;
         if (value instanceof Long) {
             long raw = ((Long) value).longValue();
-            if (isValidInteger(raw)) return new Integer((int) raw);
+            if (isValidInteger(raw)) return Integer.valueOf((int) raw);
         }
         return null;
     }
@@ -172,7 +172,7 @@ final class ComparableValue implements Value {
     @Override
     public Long asLong() {
         if (value instanceof Long) return (Long) value;
-        if (value instanceof Integer) return new Long(((Integer) value).longValue());
+        if (value instanceof Integer) return Long.valueOf(((Integer) value).longValue());
         return null;
     }
 
@@ -201,15 +201,17 @@ final class ComparableValue implements Value {
         if (value instanceof Float) return (Float) value;
         if (value instanceof Double) {
             double raw = ((Double) value).doubleValue();
-            if (isValidFloat(raw)) return new Float((float) raw);
+            if (isValidFloat(raw)) return Float.valueOf((float) raw);
         }
+        if (value instanceof Number) return ((Number)value).floatValue();
         return null;
     }
 
     @Override
     public Double asDouble() {
         if (value instanceof Double) return (Double) value;
-        if (value instanceof Float) return new Double(((Float) value).doubleValue());
+        if (value instanceof Float) return Double.valueOf(((Float) value).doubleValue());
+        if (value instanceof Number) return ((Number)value).doubleValue();
         return null;
     }
 

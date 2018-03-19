@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PostgresConnectorConfig.SecureConnectionMode;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.jdbc.JdbcConfiguration;
@@ -31,6 +32,7 @@ public final class TestHelper {
 
     protected static final String TEST_SERVER = "test_server";
     protected static final String PK_FIELD = "pk";
+    private static final String TEST_PROPERTY_PREFIX = "debezium.test.";
 
     private TestHelper() {
     }
@@ -44,10 +46,21 @@ public final class TestHelper {
      * @throws SQLException if there is a problem obtaining a replication connection
      */
     public static ReplicationConnection createForReplication(String slotName, boolean dropOnClose) throws SQLException {
+        final PostgresConnectorConfig.LogicalDecoder plugin = decoderPlugin();
         return ReplicationConnection.builder(defaultJdbcConfig())
+                                    .withPlugin(plugin)
                                     .withSlot(slotName)
+                                    .withTypeRegistry(getTypeRegistry())
                                     .dropSlotOnClose(dropOnClose)
                                     .build();
+    }
+
+    /**
+     * @return the decoder plugin used for testing and configured by system property
+     */
+    static PostgresConnectorConfig.LogicalDecoder decoderPlugin() {
+        final String s = System.getProperty(PostgresConnectorConfig.PLUGIN_NAME.name());
+        return (s == null || s.length() == 0) ? PostgresConnectorConfig.LogicalDecoder.DECODERBUFS : PostgresConnectorConfig.LogicalDecoder.parse(s);
     }
 
     /**
@@ -95,6 +108,18 @@ public final class TestHelper {
                                       .map(schema -> "DROP SCHEMA IF EXISTS " + schema + " CASCADE;")
                                       .collect(Collectors.joining(lineSeparator));
         TestHelper.execute(dropStmts);
+        try {
+            TestHelper.executeDDL("init_database.ddl");
+        }
+        catch (Exception e) {
+            throw new IllegalStateException("Failed to initialize database", e);
+        }
+    }
+
+    public static TypeRegistry getTypeRegistry() {
+        try (final PostgresConnection connection = new PostgresConnection(defaultJdbcConfig())) {
+            return connection.getTypeRegistry();
+        }
     }
 
     protected static Set<String> schemaNames() throws SQLException {
@@ -117,9 +142,16 @@ public final class TestHelper {
         JdbcConfiguration jdbcConfiguration = defaultJdbcConfig();
         Configuration.Builder builder = Configuration.create();
         jdbcConfiguration.forEach((field, value) -> builder.with(PostgresConnectorConfig.DATABASE_CONFIG_PREFIX + field, value));
-        return builder.with(PostgresConnectorConfig.SERVER_NAME, TEST_SERVER)
-                      .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, true)
-                      .with(PostgresConnectorConfig.STATUS_UPDATE_INTERVAL_MS, 100);
+        builder.with(PostgresConnectorConfig.SERVER_NAME, TEST_SERVER)
+               .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, true)
+               .with(PostgresConnectorConfig.STATUS_UPDATE_INTERVAL_MS, 100)
+               .with(PostgresConnectorConfig.PLUGIN_NAME, decoderPlugin())
+               .with(PostgresConnectorConfig.SSL_MODE, SecureConnectionMode.DISABLED);
+        final String testNetworkTimeout = System.getProperty(TEST_PROPERTY_PREFIX + "network.timeout");
+        if (testNetworkTimeout != null && testNetworkTimeout.length() != 0) {
+            builder.with(PostgresConnectorConfig.STATUS_UPDATE_INTERVAL_MS, Integer.parseInt(testNetworkTimeout));
+        }
+        return builder;
     }
 
     protected static void executeDDL(String ddlFile) throws Exception {
@@ -135,5 +167,13 @@ public final class TestHelper {
 
     protected static String topicName(String suffix) {
         return TestHelper.TEST_SERVER + "." + suffix;
+    }
+
+    protected static boolean shouldSSLConnectionFail() {
+        return Boolean.parseBoolean(System.getProperty(TEST_PROPERTY_PREFIX + "ssl.failonconnect", "true"));
+    }
+
+    protected static int waitTimeForRecords() {
+        return Integer.parseInt(System.getProperty(TEST_PROPERTY_PREFIX + "records.waittime", "2"));
     }
 }

@@ -9,94 +9,47 @@ package io.debezium.connector.postgresql;
 import java.math.BigDecimal;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 
-import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
 import org.apache.kafka.common.config.ConfigValue;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
+import io.debezium.connector.postgresql.connection.MessageDecoder;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.connector.postgresql.connection.pgproto.PgProtoMessageDecoder;
+import io.debezium.connector.postgresql.connection.wal2json.Wal2JsonMessageDecoder;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
+import io.debezium.jdbc.TemporalPrecisionMode;
 
 /**
  * The configuration properties for the {@link PostgresConnector}
  *
  * @author Horia Chiorean
  */
-public class PostgresConnectorConfig {
-
-    /**
-     * The set of predefined TemporalPrecisionMode options or aliases.
-     */
-    public enum TemporalPrecisionMode implements EnumeratedValue {
-
-        /**
-         * Represent time and date values based upon the resolution in the database, using {@link io.debezium.time} semantic
-         * types.
-         */
-        ADAPTIVE("adaptive"),
-
-        /**
-         * Represent time and date values using Kafka Connect {@link org.apache.kafka.connect.data} logical types, which always
-         * have millisecond precision.
-         */
-        CONNECT("connect");
-
-        private final String value;
-
-        TemporalPrecisionMode(String value) {
-            this.value = value;
-        }
-
-        @Override
-        public String getValue() {
-            return value;
-        }
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @return the matching option, or null if no match is found
-         */
-        public static TemporalPrecisionMode parse(String value) {
-            if (value == null) return null;
-            value = value.trim();
-            for (TemporalPrecisionMode option : TemporalPrecisionMode.values()) {
-                if (option.getValue().equalsIgnoreCase(value)) return option;
-            }
-            return null;
-        }
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @param defaultValue the default value; may be null
-         * @return the matching option, or null if no match is found and the non-null default is invalid
-         */
-        public static TemporalPrecisionMode parse(String value, String defaultValue) {
-            TemporalPrecisionMode mode = parse(value);
-            if (mode == null && defaultValue != null) mode = parse(defaultValue);
-            return mode;
-        }
-    }
+public class PostgresConnectorConfig extends CommonConnectorConfig {
 
     /**
      * The set of predefined DecimalHandlingMode options or aliases.
      */
-    public static enum DecimalHandlingMode implements EnumeratedValue {
+    public enum DecimalHandlingMode implements EnumeratedValue {
         /**
          * Represent {@code DECIMAL} and {@code NUMERIC} values as precise {@link BigDecimal} values, which are
          * represented in change events in a binary form. This is precise but difficult to use.
          */
         PRECISE("precise"),
+
+        /**
+         * Represent {@code DECIMAL} and {@code NUMERIC} values as a string values. This is precise, it supports also special values
+         * but the type information is lost.
+         */
+        STRING("string"),
 
         /**
          * Represent {@code DECIMAL} and {@code NUMERIC} values as precise {@code double} values. This may be less precise
@@ -119,6 +72,8 @@ public class PostgresConnectorConfig {
             switch (this) {
                 case DOUBLE:
                     return DecimalMode.DOUBLE;
+                case STRING:
+                    return DecimalMode.STRING;
                 case PRECISE:
                 default:
                     return DecimalMode.PRECISE;
@@ -335,23 +290,77 @@ public class PostgresConnectorConfig {
         }
     }
 
+    public enum LogicalDecoder implements EnumeratedValue {
+        DECODERBUFS("decoderbufs") {
+            @Override
+            public MessageDecoder messageDecoder() {
+                return new PgProtoMessageDecoder();
+            }
+        },
+        WAL2JSON("wal2json") {
+            @Override
+            public MessageDecoder messageDecoder() {
+                return new Wal2JsonMessageDecoder();
+            }
+        },
+        WAL2JSON_RDS("wal2json_rds") {
+            @Override
+            public MessageDecoder messageDecoder() {
+                return new Wal2JsonMessageDecoder();
+            }
+
+            @Override
+            public boolean forceRds() {
+                return true;
+            }
+
+            @Override
+            public String getPostgresPluginName() {
+                return "wal2json";
+            }
+        };
+
+        private final String decoderName;
+
+        LogicalDecoder(String decoderName) {
+            this.decoderName = decoderName;
+        }
+
+        public abstract MessageDecoder messageDecoder();
+
+        public boolean forceRds() {
+            return false;
+        }
+
+        public static LogicalDecoder parse(String s) {
+            return valueOf(s.trim().toUpperCase());
+        }
+
+        @Override
+        public String getValue() {
+            return decoderName;
+        }
+
+        public String getPostgresPluginName() {
+            return getValue();
+        }
+    }
+
     protected static final String DATABASE_CONFIG_PREFIX = "database.";
     protected static final int DEFAULT_PORT = 5432;
-    protected static final int DEFAULT_MAX_BATCH_SIZE = 10240;
-    protected static final int DEFAULT_MAX_QUEUE_SIZE = 20480;
     protected static final int DEFAULT_ROWS_FETCH_SIZE = 10240;
-    protected static final long DEFAULT_POLL_INTERVAL_MILLIS = 500;
     protected static final long DEFAULT_SNAPSHOT_LOCK_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(10);
 
     private static final String TABLE_WHITELIST_NAME = "table.whitelist";
 
     public static final Field PLUGIN_NAME = Field.create("plugin.name")
                                               .withDisplayName("Plugin")
-                                              .withType(Type.STRING)
+                                              .withEnum(LogicalDecoder.class, LogicalDecoder.DECODERBUFS)
                                               .withWidth(Width.MEDIUM)
                                               .withImportance(Importance.MEDIUM)
-                                              .withDefault(ReplicationConnection.Builder.DEFAULT_PLUGIN_NAME)
-                                              .withDescription("The name of the Postgres logical decoding plugin installed on the server. Defaults to 'decoderbufs'");
+                                              .withDescription("The name of the Postgres logical decoding plugin installed on the server. " +
+                                                      "Supported values are '"+ LogicalDecoder.DECODERBUFS.getValue() + "' and '"+ LogicalDecoder.WAL2JSON.getValue() + "'. " +
+                                                      "Defaults to '"+ LogicalDecoder.DECODERBUFS.getValue() + "'.");
 
     public static final Field SLOT_NAME = Field.create("slot.name")
                                               .withDisplayName("Slot")
@@ -431,24 +440,6 @@ public class PostgresConnectorConfig {
                                                       + "'table' (the default) each DB table will have a separate Kafka topic; "
                                                       + "'schema' there will be one Kafka topic per DB schema; events from multiple topics belonging to the same schema will be placed on the same topic");
 
-    public static final Field MAX_QUEUE_SIZE = Field.create("max.queue.size")
-                                                    .withDisplayName("Change event buffer size")
-                                                    .withType(Type.INT)
-                                                    .withWidth(Width.SHORT)
-                                                    .withImportance(Importance.MEDIUM)
-                                                    .withDescription("Maximum size of the queue for change events read from the database log but not yet recorded or forwarded. Defaults to 20480, and should always be larger than the maximum batch size.")
-                                                    .withDefault(DEFAULT_MAX_QUEUE_SIZE)
-                                                    .withValidation(PostgresConnectorConfig::validateMaxQueueSize);
-
-    public static final Field MAX_BATCH_SIZE = Field.create("max.batch.size")
-                                                    .withDisplayName("Change event batch size")
-                                                    .withType(Type.INT)
-                                                    .withWidth(Width.SHORT)
-                                                    .withImportance(Importance.MEDIUM)
-                                                    .withDescription("Maximum size of each batch of source records. Defaults to 10240.")
-                                                    .withDefault(DEFAULT_MAX_BATCH_SIZE)
-                                                    .withValidation(Field::isPositiveInteger);
-
     public static final Field ROWS_FETCH_SIZE = Field.create("rows.fetch.size")
                                                      .withDisplayName("Result set fetch size")
                                                      .withType(Type.INT)
@@ -457,15 +448,6 @@ public class PostgresConnectorConfig {
                                                      .withDescription("The maximum number of DB rows that should be loaded into memory while performing a snapshot")
                                                      .withDefault(DEFAULT_ROWS_FETCH_SIZE)
                                                      .withValidation(Field::isPositiveLong);
-
-    public static final Field POLL_INTERVAL_MS = Field.create("poll.interval.ms")
-                                                      .withDisplayName("Poll interval (ms)")
-                                                      .withType(Type.LONG)
-                                                      .withWidth(Width.SHORT)
-                                                      .withImportance(Importance.MEDIUM)
-                                                      .withDescription("Frequency in milliseconds to wait for new change events to appear after receiving no events. Defaults to 0.5 second (500 ms).")
-                                                      .withDefault(DEFAULT_POLL_INTERVAL_MILLIS)
-                                                      .withValidation(Field::isPositiveInteger);
 
     public static final Field SSL_MODE = Field.create(DATABASE_CONFIG_PREFIX + "sslmode")
                                               .withDisplayName("SSL mode")
@@ -617,6 +599,7 @@ public class PostgresConnectorConfig {
                                                          .withImportance(Importance.MEDIUM)
                                                          .withDescription("Time, date, and timestamps can be represented with different kinds of precisions, including:"
                                                                  + "'adaptive' (the default) bases the precision of time, date, and timestamp values on the database column's precision; "
+                                                                 + "'adaptive_time_microseconds' like 'adaptive' mode, but TIME fields always use microseconds precision;"
                                                                  + "'connect' always represents time, date, and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
                                                                  + "which uses millisecond precision regardless of the database columns' precision .");
 
@@ -627,6 +610,7 @@ public class PostgresConnectorConfig {
                                                         .withImportance(Importance.MEDIUM)
                                                         .withDescription("Specify how DECIMAL and NUMERIC columns should be represented in change events, including:"
                                                                 + "'precise' (the default) uses java.math.BigDecimal to represent values, which are encoded in the change events using a binary representation and Kafka Connect's 'org.apache.kafka.connect.data.Decimal' type; "
+                                                                + "'string' uses string to represent values (including the special ones like NaN or Infinity); "
                                                                 + "'double' represents values using Java's 'double', which may not offer the precision but will be far easier to use in consumers.");
 
     public static final Field STATUS_UPDATE_INTERVAL_MS = Field.create("status.update.interval.ms")
@@ -645,35 +629,57 @@ public class PostgresConnectorConfig {
             .withDescription("Enable or disable TCP keep-alive probe to avoid dropping TCP connection")
             .withValidation(Field::isBoolean);
 
+    public static final Field INCLUDE_UNKNOWN_DATATYPES = Field.create("include.unknown.datatypes")
+            .withDisplayName("Include unknown datatypes")
+            .withType(Type.BOOLEAN)
+            .withDefault(false)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Specify whether the fields of data type not supported by Debezium should be processed:"
+                    + "'false' (the default) omits the fields; "
+                    + "'true' converts the field into an implementation dependent binary representation.");
+
+    public static final Field SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE = Field.create("snapshot.select.statement.overrides")
+            .withDisplayName("List of tables where the default select statement used during snapshotting should be overridden.")
+            .withType(Type.STRING)
+            .withWidth(Width.LONG)
+            .withImportance(Importance.MEDIUM)
+            .withDescription(" This property contains a comma-separated list of fully-qualified tables (DB_NAME.TABLE_NAME). Select statements for the individual tables are " +
+                    "specified in further configuration properties, one for each table, identified by the id 'snapshot.select.statement.overrides.[DB_NAME].[TABLE_NAME]'. " +
+                    "The value of those properties is the select statement to use when retrieving data from the specific table during snapshotting. " +
+                    "A possible use case for large append-only tables is setting a specific point where to start (resume) snapshotting, in case a previous snapshotting was interrupted.");
+
     /**
      * The set of {@link Field}s defined as part of this configuration.
      */
     public static Field.Set ALL_FIELDS = Field.setOf(PLUGIN_NAME, SLOT_NAME, DROP_SLOT_ON_STOP,
                                                      DATABASE_NAME, USER, PASSWORD, HOSTNAME, PORT, SERVER_NAME,
-                                                     TOPIC_SELECTION_STRATEGY, MAX_BATCH_SIZE,
-                                                     MAX_QUEUE_SIZE, POLL_INTERVAL_MS, SCHEMA_WHITELIST,
+                                                     TOPIC_SELECTION_STRATEGY, CommonConnectorConfig.MAX_BATCH_SIZE,
+                                                     CommonConnectorConfig.MAX_QUEUE_SIZE, CommonConnectorConfig.POLL_INTERVAL_MS, SCHEMA_WHITELIST,
                                                      SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
                                                      COLUMN_BLACKLIST, SNAPSHOT_MODE,
                                                      TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE,
                                                      SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD,
                                                      SSL_ROOT_CERT, SSL_CLIENT_KEY, SNAPSHOT_LOCK_TIMEOUT_MS, ROWS_FETCH_SIZE, SSL_SOCKET_FACTORY,
-                                                     STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE);
+                                                     STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, INCLUDE_UNKNOWN_DATATYPES,
+                                                     SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
 
     private final Configuration config;
     private final String serverName;
-    private final boolean adaptiveTimePrecision;
+    private final TemporalPrecisionMode temporalPrecisionMode;
     private final DecimalMode decimalHandlingMode;
     private final SnapshotMode snapshotMode;
 
     protected PostgresConnectorConfig(Configuration config) {
+        super(config);
+
         this.config = config;
         String serverName = config.getString(PostgresConnectorConfig.SERVER_NAME);
         if (serverName == null) {
             serverName = hostname() + ":" + port() + "/" + databaseName();
         }
         this.serverName = serverName;
-        TemporalPrecisionMode timePrecisionMode = TemporalPrecisionMode.parse(config.getString(TIME_PRECISION_MODE));
-        this.adaptiveTimePrecision = TemporalPrecisionMode.ADAPTIVE == timePrecisionMode;
+        this.temporalPrecisionMode = TemporalPrecisionMode.parse(config.getString(TIME_PRECISION_MODE));
         String decimalHandlingModeStr = config.getString(PostgresConnectorConfig.DECIMAL_HANDLING_MODE);
         DecimalHandlingMode decimalHandlingMode = DecimalHandlingMode.parse(decimalHandlingModeStr);
         this.decimalHandlingMode = decimalHandlingMode.asDecimalMode();
@@ -692,8 +698,8 @@ public class PostgresConnectorConfig {
         return config.getString(DATABASE_NAME);
     }
 
-    protected String pluginName() {
-        return config.getString(PLUGIN_NAME);
+    protected LogicalDecoder plugin() {
+        return LogicalDecoder.parse(config.getString(PLUGIN_NAME));
     }
 
     protected String slotName() {
@@ -708,27 +714,19 @@ public class PostgresConnectorConfig {
         return config.getInteger(STATUS_UPDATE_INTERVAL_MS, null);
     }
 
-    protected int maxQueueSize() {
-        return config.getInteger(MAX_QUEUE_SIZE);
-    }
-
-    protected int maxBatchSize() {
-        return config.getInteger(MAX_BATCH_SIZE);
-    }
-
-    protected long pollIntervalMs() {
-        return config.getLong(POLL_INTERVAL_MS);
-    }
-
-    protected boolean adaptiveTimePrecision() {
-        return adaptiveTimePrecision;
+    protected TemporalPrecisionMode temporalPrecisionMode() {
+        return temporalPrecisionMode;
     }
 
     protected DecimalMode decimalHandlingMode() {
         return decimalHandlingMode;
     }
 
-    protected Configuration jdbcConfig() {
+    protected boolean includeUnknownDatatypes() {
+        return config.getBoolean(INCLUDE_UNKNOWN_DATATYPES);
+    }
+
+    public Configuration jdbcConfig() {
         return config.subset(DATABASE_CONFIG_PREFIX, true);
     }
 
@@ -745,10 +743,6 @@ public class PostgresConnectorConfig {
 
     protected Map<String, ConfigValue> validate() {
         return config.validate(ALL_FIELDS);
-    }
-
-    protected boolean validateAndRecord(Consumer<String> errorConsumer) {
-        return config.validateAndRecord(ALL_FIELDS, errorConsumer);
     }
 
     protected String schemaBlacklist() {
@@ -786,8 +780,17 @@ public class PostgresConnectorConfig {
     protected boolean alwaysTakeSnapshot() {
         return SnapshotMode.ALWAYS == this.snapshotMode;
     }
+
     protected boolean initialOnlySnapshot() {
         return SnapshotMode.INITIAL_ONLY == this.snapshotMode;
+    }
+
+    protected String snapshotSelectOverrides() {
+        return config.getString(PostgresConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE);
+    }
+
+    protected String snapshotSelectOverrideForTable(String table) {
+        return config.getString(PostgresConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE + "." + table);
     }
 
     protected static ConfigDef configDef() {
@@ -796,26 +799,11 @@ public class PostgresConnectorConfig {
                     USER, PASSWORD, SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD, SSL_ROOT_CERT, SSL_CLIENT_KEY,
                     DROP_SLOT_ON_STOP, SSL_SOCKET_FACTORY, STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE);
         Field.group(config, "Events", SCHEMA_WHITELIST, SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
-                    COLUMN_BLACKLIST);
-        Field.group(config, "Connector", TOPIC_SELECTION_STRATEGY, POLL_INTERVAL_MS, MAX_BATCH_SIZE, MAX_QUEUE_SIZE,
+                    COLUMN_BLACKLIST, INCLUDE_UNKNOWN_DATATYPES, SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE,
+                    CommonConnectorConfig.TOMBSTONES_ON_DELETE);
+        Field.group(config, "Connector", TOPIC_SELECTION_STRATEGY, CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.MAX_QUEUE_SIZE,
                     SNAPSHOT_MODE, SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, ROWS_FETCH_SIZE);
         return config;
-    }
-
-
-    private static int validateMaxQueueSize(Configuration config, Field field, Field.ValidationOutput problems) {
-        int maxQueueSize = config.getInteger(field);
-        int maxBatchSize = config.getInteger(MAX_BATCH_SIZE);
-        int count = 0;
-        if (maxQueueSize <= 0) {
-            problems.accept(field, maxQueueSize, "A positive queue size is required");
-            ++count;
-        }
-        if (maxQueueSize <= maxBatchSize) {
-            problems.accept(field, maxQueueSize, "Must be larger than the maximum batch size");
-            ++count;
-        }
-        return count;
     }
 
     private static int validateSchemaBlacklist(Configuration config, Field field, Field.ValidationOutput problems) {
@@ -827,7 +815,6 @@ public class PostgresConnectorConfig {
         }
         return 0;
     }
-
 
     private static int validateTableBlacklist(Configuration config, Field field, Field.ValidationOutput problems) {
         String whitelist = config.getString(TABLE_WHITELIST);

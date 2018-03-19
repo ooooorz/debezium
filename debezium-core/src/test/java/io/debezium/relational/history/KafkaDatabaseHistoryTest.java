@@ -5,6 +5,10 @@
  */
 package io.debezium.relational.history;
 
+import static org.fest.assertions.Assertions.assertThat;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
 import java.io.File;
 import java.util.Map;
 
@@ -16,8 +20,6 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
-
-import static org.fest.assertions.Assertions.assertThat;
 
 import io.debezium.config.Configuration;
 import io.debezium.kafka.KafkaCluster;
@@ -56,6 +58,7 @@ public class KafkaDatabaseHistoryTest {
                                   .deleteDataPriorToStartup(true)
                                   .deleteDataUponShutdown(true)
                                   .addBrokers(1)
+                                  .withKafkaConfiguration(Collect.propertiesOf("auto.create.topics.enable", "false"))
                                   .startup();
         history = new KafkaDatabaseHistory();
     }
@@ -87,7 +90,7 @@ public class KafkaDatabaseHistoryTest {
                                             .with(KafkaDatabaseHistory.BOOTSTRAP_SERVERS, kafka.brokerList())
                                             .with(KafkaDatabaseHistory.TOPIC, topicName)
                                             .with(DatabaseHistory.NAME, "my-db-history")
-                                            .with(KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS, 1000)
+                                            .with(KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS, 500)
                                             // new since 0.10.1.0 - we want a low value because we're running everything locally
                                             // in this test. However, it can't be so low that the broker returns the same
                                             // messages more than once.
@@ -104,6 +107,11 @@ public class KafkaDatabaseHistoryTest {
 
         // Should be able to call start more than once ...
         history.start();
+
+        history.initializeStorage();
+
+        // Calling it another time to ensure we can work with the DB history topic already existing
+        history.initializeStorage();
 
         DdlParser recoveryParser = new DdlParserSql2003();
         DdlParser ddlParser = new DdlParserSql2003();
@@ -124,7 +132,7 @@ public class KafkaDatabaseHistoryTest {
         ddl = "CREATE TABLE foo ( name VARCHAR(255) NOT NULL PRIMARY KEY); \n" +
                 "CREATE TABLE customers ( id INTEGER NOT NULL PRIMARY KEY, name VARCHAR(100) NOT NULL ); \n" +
                 "CREATE TABLE products ( productId INTEGER NOT NULL PRIMARY KEY, desc VARCHAR(255) NOT NULL); \n";
-        history.record(source, position, "db1", tables1, ddl);
+        history.record(source, position, "db1", ddl);
 
         // Parse the DDL statement 3x and each time update a different Tables object ...
         ddlParser.parse(ddl, tables1);
@@ -137,7 +145,7 @@ public class KafkaDatabaseHistoryTest {
         // Record a drop statement and parse it for 2 of our 3 Tables...
         setLogPosition(39);
         ddl = "DROP TABLE foo;";
-        history.record(source, position, "db1", tables2, ddl);
+        history.record(source, position, "db1", ddl);
         ddlParser.parse(ddl, tables2);
         assertThat(tables2.size()).isEqualTo(2);
         ddlParser.parse(ddl, tables3);
@@ -146,7 +154,7 @@ public class KafkaDatabaseHistoryTest {
         // Record another DDL statement and parse it for 1 of our 3 Tables...
         setLogPosition(10003);
         ddl = "CREATE TABLE suppliers ( supplierId INTEGER NOT NULL PRIMARY KEY, name VARCHAR(255) NOT NULL);";
-        history.record(source, position, "db1", tables3, ddl);
+        history.record(source, position, "db1", ddl);
         ddlParser.parse(ddl, tables3);
         assertThat(tables3.size()).isEqualTo(3);
 
@@ -244,5 +252,36 @@ public class KafkaDatabaseHistoryTest {
         }
 
         testHistoryTopicContent(false);
+    }
+
+    @Test
+    public void testExists() {
+        // happy path
+        testHistoryTopicContent(true);
+        assertTrue(history.exists());
+
+        // Set history to use dummy topic
+        Configuration config = Configuration.create()
+                .with(KafkaDatabaseHistory.BOOTSTRAP_SERVERS, kafka.brokerList())
+                .with(KafkaDatabaseHistory.TOPIC, "dummytopic")
+                .with(DatabaseHistory.NAME, "my-db-history")
+                .with(KafkaDatabaseHistory.RECOVERY_POLL_INTERVAL_MS, 500)
+                // new since 0.10.1.0 - we want a low value because we're running everything locally
+                // in this test. However, it can't be so low that the broker returns the same
+                // messages more than once.
+                .with(KafkaDatabaseHistory.consumerConfigPropertyName(
+                      ConsumerConfig.MAX_POLL_INTERVAL_MS_CONFIG),
+                      100)
+                .with(KafkaDatabaseHistory.consumerConfigPropertyName(
+                      ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG),
+                      50000)
+                .with(KafkaDatabaseHistory.SKIP_UNPARSEABLE_DDL_STATEMENTS, true)
+                .build();
+
+        history.configure(config, null);
+        history.start();
+
+        // dummytopic should not exist yet
+        assertFalse(history.exists());
     }
 }

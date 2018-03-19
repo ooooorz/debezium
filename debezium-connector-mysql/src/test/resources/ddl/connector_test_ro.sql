@@ -3,15 +3,15 @@
 -- ----------------------------------------------------------------------------------------------------------------
 
 -- Create and populate our products using a single insert with many rows
-CREATE TABLE products (
+CREATE TABLE Products (
   id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(255) NOT NULL,
   description VARCHAR(512),
   weight FLOAT
 );
-ALTER TABLE products AUTO_INCREMENT = 101;
+ALTER TABLE Products AUTO_INCREMENT = 101;
 
-INSERT INTO products 
+INSERT INTO Products
 VALUES (default,"scooter","Small 2-wheel scooter",3.14),
        (default,"car battery","12V car battery",8.1),
        (default,"12-pack drill bits","12-pack of drill bits with sizes ranging from #40 to #3",0.8),
@@ -26,7 +26,7 @@ VALUES (default,"scooter","Small 2-wheel scooter",3.14),
 CREATE TABLE products_on_hand (
   product_id INTEGER NOT NULL PRIMARY KEY,
   quantity INTEGER NOT NULL,
-  FOREIGN KEY (product_id) REFERENCES products(id)
+  FOREIGN KEY (product_id) REFERENCES Products(id)
 );
 
 INSERT INTO products_on_hand VALUES (101,3);
@@ -62,7 +62,7 @@ CREATE TABLE orders (
   quantity INTEGER NOT NULL,
   product_id INTEGER NOT NULL,
   FOREIGN KEY order_customer (purchaser) REFERENCES customers(id),
-  FOREIGN KEY ordered_product (product_id) REFERENCES products(id)
+  FOREIGN KEY ordered_product (product_id) REFERENCES Products(id)
 ) AUTO_INCREMENT = 10001;
 
 INSERT INTO orders 
@@ -71,3 +71,21 @@ VALUES (default, '2016-01-16', 1001, 1, 102),
        (default, '2016-02-18', 1004, 3, 109),
        (default, '2016-02-19', 1002, 2, 106),
        (default, '2016-02-21', 1003, 1, 107);
+
+-- Temporary table statements should be ignored
+CREATE TEMPORARY TABLE ids (id int);
+CREATE TEMPORARY TABLE ids2 (id int);
+INSERT INTO ids VALUES(1);
+INSERT INTO ids2 VALUES(1);
+DROP TEMPORARY TABLE ids;
+DROP TEMPORARY TABLE ids2;
+
+-- DBZ-342 handle TIME values that exceed the value range of java.sql.Time
+CREATE TABLE dbz_342_timetest (
+  c1 TIME(2) PRIMARY KEY,
+  c2 TIME(0),
+  c3 TIME(3),
+  c4 TIME(3),
+  c5 TIME(6)
+);
+INSERT INTO dbz_342_timetest VALUES ('517:51:04.777', '-13:14:50', '-733:00:00.0011', '-1:59:59.0011', '-838:59:58.999999');

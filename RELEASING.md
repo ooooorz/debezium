@@ -3,10 +3,13 @@
 The Debezium project uses Maven for its build system, relying up on the _release_ plugin to most of the work. This document describes the steps required to perform a release.
 
 ## Verify Jira issues
-All issues planned for this release must be resolved. If not they have to either be re-planned to another release or rejected. Use JQL query to find offending issues
+
+All issues planned for this release must be resolved. If not, they have to either be re-planned to another release or rejected. Use JQL query to find offending issues
 ```
 project=DBZ AND fixVersion=<VERSION> AND status NOT IN ('Resolved', 'Closed')
 ```
+
+Also make sure that each issue is assigned to a component ("mysql-connector" etc.).
 
 ## Update the changelog
 
@@ -15,6 +18,9 @@ It currently exists in two versions, one in the main code repo and one on the we
 
 * https://github.com/debezium/debezium/blob/master/CHANGELOG.md
 * https://github.com/debezium/debezium.github.io/blob/develop/docs/releases.asciidoc
+
+JIRA issues that break backwards compatability for existing consumers, should be marked with the "add-to-upgrade-guide" label.
+Search for them using [this query](https://issues.jboss.org/issues/?jql=labels%20%3D%20add-to-upgrade-guide) and describe the implications and required steps for upgrading in the changelog on the website.
 
 ## Start with the correct branch
 
@@ -173,12 +179,20 @@ Only after the artifacts are available on Maven Central can you merge the pull r
 Otherwise, for major and minor releases your pull request should have added new Docker images, and you need to log into [Debezium's Docker Hub organization](https://hub.docker.com/r/debezium/) and add/update the build settings for each of the affected images.
 
 With every release the Docker image for PostgreSQL needs to be updated as well.
-First create a tag in the https://github.com/debezium/postgres-decoderbufs[postgres-decoderbufs] repository:
+First create a tag in the [postgres-decoderbufs](https://github.com/debezium/postgres-decoderbufs) repository:
 
     $ git tag v<%version%> && git push upstream v<%version%>
 
-Then update the Debezium version referenced in the https://github.com/debezium/docker-images/blob/master/postgres/9.6/Dockerfile#L22[postgres Docker file]
+Then update the Debezium version referenced in the [Postgres Docker file](https://github.com/debezium/docker-images/blob/master/postgres/9.6/Dockerfile#L22)
 and push that commit which will cause the image to be re-published on Docker Hub automatically.
+
+## Reconfigure Docker Hub builds
+If a new version of Docker images is going to be added it is necessary in Docker Hub build settings to
+
+* add a new build for each image with new version
+* remove builds for obsolete versions
+* update `nightly` and `latest` build tags
+* update rules the creates micro tags
 
 ## Close Jira issues
 Close all issues relesed with this version. The affected issues can be found using JQL query
@@ -191,11 +205,16 @@ Then mark release in Jira as *Released* using `Release` action.
 
 Update the documentation on the [Debezium website](http://debezium.io) by following the [instructions for changing the website](http://debezium.io/docs/contribute/#website).
 This typically involves updating the documentation (look for pending pull requests tagged as "Merge after next release") and writing a blog post to announce the release.
+Also update the `debezium-version` and `debezium-docker-label` attributes in _\_config/site.yml_.
 Then, create a pull request with your changes and wait for a committer to approve and merge your changes.
 
 When the blog post is available, use the [Debezium Twitter account](https://twitter.com/debezium) to announce the release by linking to the blog post.
 
 # Automated Release
+There are few manual steps to be completede before the execution
+* Update [the changelog](#update-the-changelog)
+* Update [configuration](#reconfigure-docker-hub-builds) for Docker Hub builds
+
 To perform release automatically invoke a [Jenkins job](http://ci.hibernate.org/view/Debezium/job/debezium-release/). Two parameters are requested
 * `RELEASE_VERSION` - a version to be released in format x.y.z
 * `DEVELOPMENT_VERSION` - next development version in format x.y.z-SNAPSHOT

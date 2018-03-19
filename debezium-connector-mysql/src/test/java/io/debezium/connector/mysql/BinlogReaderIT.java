@@ -6,8 +6,14 @@
 package io.debezium.connector.mysql;
 
 import static org.fest.assertions.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -16,18 +22,21 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.mysql.MySqlConnectorConfig.EventProcessingFailureHandlingMode;
 import io.debezium.data.Envelope;
 import io.debezium.data.KeyValueStore;
 import io.debezium.data.KeyValueStore.Collection;
 import io.debezium.data.SchemaChangeHistory;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.time.ZonedTimestamp;
 import io.debezium.util.Testing;
 
@@ -117,16 +126,17 @@ public class BinlogReaderIT {
 
         // Poll for records ...
         // Testing.Print.enable();
-        int expected = 9 + 9 + 4 + 5; // only the inserts for our 4 tables in this database
+        int expected = 9 + 9 + 4 + 5 + 1; // only the inserts for our 4 tables in this database and 1 create table
         int consumed = consumeAtLeast(expected);
         assertThat(consumed).isGreaterThanOrEqualTo(expected);
 
+        store.sourceRecords().forEach(System.out::println);
         // There should be no schema changes ...
         assertThat(schemaChanges.recordCount()).isEqualTo(0);
 
         // Check the records via the store ...
-        assertThat(store.collectionCount()).isEqualTo(4);
-        Collection products = store.collection(DATABASE.getDatabaseName(), "products");
+        assertThat(store.collectionCount()).isEqualTo(5);
+        Collection products = store.collection(DATABASE.getDatabaseName(), productsTableName());
         assertThat(products.numberOfCreates()).isEqualTo(9);
         assertThat(products.numberOfUpdates()).isEqualTo(0);
         assertThat(products.numberOfDeletes()).isEqualTo(0);
@@ -177,8 +187,8 @@ public class BinlogReaderIT {
 
         // Poll for records ...
         // Testing.Print.enable();
-        int expectedSchemaChangeCount = 4 + 2; // 4 tables plus 2 alters
-        int expected = (9 + 9 + 4 + 5) + expectedSchemaChangeCount; // only the inserts for our 4 tables in this database, plus
+        int expectedSchemaChangeCount = 5 + 2; // 5 tables plus 2 alters
+        int expected = (9 + 9 + 4 + 5 + 1) + expectedSchemaChangeCount; // only the inserts for our 4 tables in this database, plus
                                                                     // schema changes
         int consumed = consumeAtLeast(expected);
         assertThat(consumed).isGreaterThanOrEqualTo(expected);
@@ -187,8 +197,8 @@ public class BinlogReaderIT {
         assertThat(schemaChanges.recordCount()).isEqualTo(expectedSchemaChangeCount);
 
         // Check the records via the store ...
-        assertThat(store.collectionCount()).isEqualTo(4);
-        Collection products = store.collection(DATABASE.getDatabaseName(), "products");
+        assertThat(store.collectionCount()).isEqualTo(5);
+        Collection products = store.collection(DATABASE.getDatabaseName(), productsTableName());
         assertThat(products.numberOfCreates()).isEqualTo(9);
         assertThat(products.numberOfUpdates()).isEqualTo(0);
         assertThat(products.numberOfDeletes()).isEqualTo(0);
@@ -253,13 +263,162 @@ public class BinlogReaderIT {
         // Check the records via the store ...
         List<SourceRecord> sourceRecords = store.sourceRecords();
         assertThat(sourceRecords.size()).isEqualTo(1);
-        ZonedDateTime expectedTimestamp = ZonedDateTime.of(LocalDateTime.parse("2014-09-08T17:51:04.780"),
-                                                           ZoneId.systemDefault());
+        // MySQL container is in UTC and the test time is during summer time period
+        ZonedDateTime expectedTimestamp = ZonedDateTime.ofInstant(
+                LocalDateTime.parse("2014-09-08T17:51:04.780").atZone(ZoneId.of("UTC")).toInstant(),
+                ZoneId.systemDefault());
         String expectedTimestampString = expectedTimestamp.format(ZonedTimestamp.FORMATTER);
         SourceRecord sourceRecord = sourceRecords.get(0);
         Struct value = (Struct) sourceRecord.value();
         Struct after = value.getStruct(Envelope.FieldName.AFTER);
         String actualTimestampString = after.getString("c4");
         assertThat(actualTimestampString).isEqualTo(expectedTimestampString);
+    }
+
+    @Test
+    @FixFor( "DBZ-342" )
+    public void shouldHandleMySQLTimeCorrectly() throws Exception {
+        final UniqueDatabase REGRESSION_DATABASE = new UniqueDatabase("logical_server_name", "regression_test")
+                .withDbHistoryPath(DB_HISTORY_PATH);
+        REGRESSION_DATABASE.createAndInitialize();
+
+        String tableName = "dbz_342_timetest";
+        config = simpleConfig().with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
+                               .with(MySqlConnectorConfig.DATABASE_WHITELIST, REGRESSION_DATABASE.getDatabaseName())
+                               .with(MySqlConnectorConfig.TABLE_WHITELIST, REGRESSION_DATABASE.qualifiedTableName(tableName))
+                               .build();
+        context = new MySqlTaskContext(config);
+        context.start();
+        context.source().setBinlogStartPoint("",0L); // start from beginning
+        context.initializeHistory();
+        reader = new BinlogReader("binlog", context);
+
+        // Start reading the binlog ...
+        reader.start();
+
+        int expectedChanges = 1; // only 1 insert
+
+        consumeAtLeast(expectedChanges);
+
+        // Check the records via the store ...
+        List<SourceRecord> sourceRecords = store.sourceRecords();
+        assertThat(sourceRecords.size()).isEqualTo(1);
+
+        SourceRecord sourceRecord = sourceRecords.get(0);
+        Struct value = (Struct) sourceRecord.value();
+        Struct after = value.getStruct(Envelope.FieldName.AFTER);
+
+        // '517:51:04.777'
+        long c1 = after.getInt64("c1");
+        Duration c1Time = Duration.ofNanos(c1 * 1_000);
+        Duration c1ExpectedTime = toDuration("PT517H51M4.78S");
+        assertEquals(c1ExpectedTime, c1Time);
+        assertEquals(c1ExpectedTime.toNanos(), c1Time.toNanos());
+        assertThat(c1Time.toNanos()).isEqualTo(1864264780000000L);
+        assertThat(c1Time).isEqualTo(Duration.ofHours(517).plusMinutes(51).plusSeconds(4).plusMillis(780));
+
+        // '-13:14:50'
+        long c2 = after.getInt64("c2");
+        Duration c2Time = Duration.ofNanos(c2 * 1_000);
+        Duration c2ExpectedTime = toDuration("-PT13H14M50S");
+        assertEquals(c2ExpectedTime, c2Time);
+        assertEquals(c2ExpectedTime.toNanos(), c2Time.toNanos());
+        assertThat(c2Time.toNanos()).isEqualTo(-47690000000000L);
+        assertTrue(c2Time.isNegative());
+        assertThat(c2Time).isEqualTo(Duration.ofHours(-13).minusMinutes(14).minusSeconds(50));
+
+        // '-733:00:00.0011'
+        long c3 = after.getInt64("c3");
+        Duration c3Time = Duration.ofNanos(c3 * 1_000);
+        Duration c3ExpectedTime = toDuration("-PT733H0M0.001S");
+        assertEquals(c3ExpectedTime, c3Time);
+        assertEquals(c3ExpectedTime.toNanos(), c3Time.toNanos());
+        assertThat(c3Time.toNanos()).isEqualTo(-2638800001000000L);
+        assertTrue(c3Time.isNegative());
+        assertThat(c3Time).isEqualTo(Duration.ofHours(-733).minusMillis(1));
+
+        // '-1:59:59.0011'
+        long c4 = after.getInt64("c4");
+        Duration c4Time = Duration.ofNanos(c4 * 1_000);
+        Duration c4ExpectedTime = toDuration("-PT1H59M59.001S");
+        assertEquals(c4ExpectedTime, c4Time);
+        assertEquals(c4ExpectedTime.toNanos(), c4Time.toNanos());
+        assertThat(c4Time.toNanos()).isEqualTo(-7199001000000L);
+        assertTrue(c4Time.isNegative());
+        assertThat(c4Time).isEqualTo(Duration.ofHours(-1).minusMinutes(59).minusSeconds(59).minusMillis(1));
+
+        // '-838:59:58.999999'
+        long c5 = after.getInt64("c5");
+        Duration c5Time = Duration.ofNanos(c5 * 1_000);
+        Duration c5ExpectedTime = toDuration("-PT838H59M58.999999S");
+        assertEquals(c5ExpectedTime, c5Time);
+        assertEquals(c5ExpectedTime.toNanos(), c5Time.toNanos());
+        assertThat(c5Time.toNanos()).isEqualTo(-3020398999999000L);
+        assertTrue(c5Time.isNegative());
+        assertThat(c5Time).isEqualTo(Duration.ofHours(-838).minusMinutes(59).minusSeconds(58).minusNanos(999999000));
+    }
+
+    @Test(expected = ConnectException.class)
+    public void shouldFailOnSchemaInconsistency() throws Exception {
+        inconsistentSchema(null);
+        consumeAtLeast(2);
+    }
+
+    @Test
+    public void shouldWarnOnSchemaInconsistency() throws Exception {
+        inconsistentSchema(EventProcessingFailureHandlingMode.WARN);
+        int consumed = consumeAtLeast(2, 2, TimeUnit.SECONDS);
+        assertThat(consumed).isZero();
+    }
+
+    @Test
+    public void shouldIgnoreOnSchemaInconsistency() throws Exception {
+        inconsistentSchema(EventProcessingFailureHandlingMode.IGNORE);
+        int consumed = consumeAtLeast(2, 2, TimeUnit.SECONDS);
+        assertThat(consumed).isZero();
+    }
+
+    private void inconsistentSchema(EventProcessingFailureHandlingMode mode) throws InterruptedException, SQLException {
+        if (mode == null) {
+            config = simpleConfig().build();
+        } else {
+            config = simpleConfig()
+                    .with(MySqlConnectorConfig.INCONSISTENT_SCHEMA_HANDLING_MODE, mode)
+                    .build();
+        }
+
+        context = new MySqlTaskContext(config);
+        context.start();
+        context.source().setBinlogStartPoint("",0L); // start from beginning
+        context.initializeHistory();
+        reader = new BinlogReader("binlog", context);
+
+        // Start reading the binlog ...
+        reader.start();
+
+        // Poll for records ...
+        // Testing.Print.enable();
+        int expected = 9 + 9 + 4 + 5 + 1; // only the inserts for our 4 tables in this database and 1 create table
+        int consumed = consumeAtLeast(expected);
+        assertThat(consumed).isGreaterThanOrEqualTo(expected);
+
+        reader.stop();
+        reader.start();
+        reader.context.dbSchema().applyDdl(context.source(), DATABASE.getDatabaseName(), "DROP TABLE customers", null);
+        try (
+                final MySQLConnection db = MySQLConnection.forTestDatabase(DATABASE.getDatabaseName());
+                final JdbcConnection connection = db.connect();
+                final Connection jdbc = connection.connection();
+                final Statement statement = jdbc.createStatement()) {
+            statement.executeUpdate("INSERT INTO customers VALUES (default,'John','Lazy','john.lazy@acme.com')");
+        }
+    }
+
+    private Duration toDuration(String duration) {
+        return Duration.parse(duration);
+    }
+
+    private String productsTableName() {
+        return context.isTableIdCaseInsensitive() ? "products" : "Products";
     }
 }

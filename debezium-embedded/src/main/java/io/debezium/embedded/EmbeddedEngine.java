@@ -5,6 +5,7 @@
  */
 package io.debezium.embedded;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -43,6 +44,7 @@ import org.slf4j.LoggerFactory;
 import io.debezium.annotation.ThreadSafe;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
+import io.debezium.embedded.spi.OffsetCommitPolicy;
 import io.debezium.util.Clock;
 import io.debezium.util.VariableLatch;
 
@@ -60,7 +62,7 @@ import io.debezium.util.VariableLatch;
  * Embedded connectors are designed to be submitted to an {@link Executor} or {@link ExecutorService} for execution by a single
  * thread, and a running connector can be stopped either by calling {@link #stop()} from another thread or by interrupting
  * the running thread (e.g., as is the case with {@link ExecutorService#shutdownNow()}).
- * 
+ *
  * @author Randall Hauch
  */
 @ThreadSafe
@@ -92,7 +94,7 @@ public final class EmbeddedEngine implements Runnable {
 
     /**
      * An optional field that specifies the file location for the {@link FileOffsetBackingStore}.
-     * 
+     *
      * @see #OFFSET_STORAGE
      */
     public static final Field OFFSET_STORAGE_FILE_FILENAME = Field.create(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG)
@@ -102,16 +104,37 @@ public final class EmbeddedEngine implements Runnable {
                                                                   .withDefault("");
 
     /**
-     * An optional field that specifies the file location for the {@link KafkaOffsetBackingStore}.
-     * 
+     * An optional field that specifies the topic name for the {@link KafkaOffsetBackingStore}.
+     *
      * @see #OFFSET_STORAGE
      */
     public static final Field OFFSET_STORAGE_KAFKA_TOPIC = Field.create(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG)
                                                                 .withDescription("The name of the Kafka topic where offsets are to be stored. "
                                                                         + "Required with other properties when 'offset.storage' is set to the "
-                                                                        +
-                                                                        KafkaOffsetBackingStore.class.getName() + " class.")
+                                                                        + KafkaOffsetBackingStore.class.getName() + " class.")
                                                                 .withDefault("");
+
+    /**
+     * An optional field that specifies the number of partitions for the {@link KafkaOffsetBackingStore}.
+     *
+     * @see #OFFSET_STORAGE
+     */
+    public static final Field OFFSET_STORAGE_KAFKA_PARTITIONS = Field.create(DistributedConfig.OFFSET_STORAGE_PARTITIONS_CONFIG)
+                                                                     .withType(ConfigDef.Type.INT)
+                                                                     .withDescription("The number of partitions used when creating the offset storage topic. "
+                                                                             + "Required with other properties when 'offset.storage' is set to the "
+                                                                             + KafkaOffsetBackingStore.class.getName() + " class.");
+
+    /**
+     * An optional field that specifies the replication factor for the {@link KafkaOffsetBackingStore}.
+     *
+     * @see #OFFSET_STORAGE
+     */
+    public static final Field OFFSET_STORAGE_KAFKA_REPLICATION_FACTOR = Field.create(DistributedConfig.OFFSET_STORAGE_REPLICATION_FACTOR_CONFIG)
+                                                                             .withType(ConfigDef.Type.SHORT)
+                                                                             .withDescription("Replication factor used when creating the offset storage topic. "
+                                                                                     + "Required with other properties when 'offset.storage' is set to the "
+                                                                                     + KafkaOffsetBackingStore.class.getName() + " class.");
 
     /**
      * An optional advanced field that specifies the maximum amount of time that the embedded connector should wait
@@ -132,6 +155,13 @@ public final class EmbeddedEngine implements Runnable {
                                                                       + "data to be committed in a future attempt.")
                                                               .withDefault(5000L)
                                                               .withValidation(Field::isPositiveInteger);
+
+    public static final Field OFFSET_COMMIT_POLICY = Field.create("offset.commit.policy")
+                                                          .withDescription("The fully-qualified class name of the commit policy type. This class must implement the interface "
+                                                                      + OffsetCommitPolicy.class.getName()
+                                                                      + ". The default is a periodic commity policy based upon time intervals.")
+                                                          .withDefault(OffsetCommitPolicy.PeriodicCommitOffsetPolicy.class.getName())
+                                                          .withValidation(Field::isClassName);
 
     protected static final Field INTERNAL_KEY_CONVERTER_CLASS = Field.create("internal.key.converter")
                                                                      .withDescription("The Converter class that should be used to serialize and deserialize key data for offsets.")
@@ -159,7 +189,7 @@ public final class EmbeddedEngine implements Runnable {
     public interface CompletionCallback {
         /**
          * Handle the completion of the embedded connector engine.
-         * 
+         *
          * @param success {@code true} if the connector completed normally, or {@code false} if the connector produced an error
          *            that prevented startup or premature termination.
          * @param message the completion message; never null
@@ -240,7 +270,7 @@ public final class EmbeddedEngine implements Runnable {
          * or until the thread is {@linkplain Thread#interrupt interrupted}.
          * <p>
          * This method returns immediately if the connector has completed already.
-         * 
+         *
          * @throws InterruptedException if the current thread is interrupted while waiting
          */
         public void await() throws InterruptedException {
@@ -252,7 +282,7 @@ public final class EmbeddedEngine implements Runnable {
          * unless the thread is {@linkplain Thread#interrupt interrupted}, or the specified waiting time elapses.
          * <p>
          * This method returns immediately if the connector has completed already.
-         * 
+         *
          * @param timeout the maximum time to wait
          * @param unit the time unit of the {@code timeout} argument
          * @return {@code true} if the completion was received, or {@code false} if the waiting time elapsed before the completion
@@ -265,7 +295,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Determine if the connector has completed.
-         * 
+         *
          * @return {@code true} if the connector has completed, or {@code false} if the connector is still running and this
          *         callback has not yet been {@link #handle(boolean, String, Throwable) notified}
          */
@@ -275,7 +305,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Get whether the connector completed normally.
-         * 
+         *
          * @return {@code true} if the connector completed normally, or {@code false} if the connector produced an error that
          *         prevented startup or premature termination (or the connector has not yet {@link #hasCompleted() completed})
          */
@@ -285,7 +315,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Get the completion message.
-         * 
+         *
          * @return the completion message, or null if the connector has not yet {@link #hasCompleted() completed}
          */
         public String message() {
@@ -294,7 +324,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Get the completion error, if there is one.
-         * 
+         *
          * @return the completion error, or null if there is no error or connector has not yet {@link #hasCompleted() completed}
          */
         public Throwable error() {
@@ -303,7 +333,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Determine if there is a completion error.
-         * 
+         *
          * @return {@code true} if there is a {@link #error completion error}, or {@code false} if there is no error or
          *         the connector has not yet {@link #hasCompleted() completed}
          */
@@ -320,7 +350,7 @@ public final class EmbeddedEngine implements Runnable {
         /**
          * Call the specified function for every {@link SourceRecord data change event} read from the source database.
          * This method must be called with a non-null consumer.
-         * 
+         *
          * @param consumer the consumer function
          * @return this builder object so methods can be chained together; never null
          */
@@ -328,7 +358,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * Use the specified configuration for the connector. The configuration is assumed to already be valid.
-         * 
+         *
          * @param config the configuration
          * @return this builder object so methods can be chained together; never null
          */
@@ -337,7 +367,7 @@ public final class EmbeddedEngine implements Runnable {
         /**
          * Use the specified class loader to find all necessary classes. Passing <code>null</code> or not calling this method
          * results in the connector using this class's class loader.
-         * 
+         *
          * @param classLoader the class loader
          * @return this builder object so methods can be chained together; never null
          */
@@ -346,7 +376,7 @@ public final class EmbeddedEngine implements Runnable {
         /**
          * Use the specified clock when needing to determine the current time. Passing <code>null</code> or not calling this
          * method results in the connector using the {@link Clock#system() system clock}.
-         * 
+         *
          * @param clock the clock
          * @return this builder object so methods can be chained together; never null
          */
@@ -354,7 +384,7 @@ public final class EmbeddedEngine implements Runnable {
 
         /**
          * When the engine's {@link EmbeddedEngine#run()} method completes, call the supplied function with the results.
-         * 
+         *
          * @param completionCallback the callback function; may be null if errors should be written to the log
          * @return this builder object so methods can be chained together; never null
          */
@@ -363,15 +393,23 @@ public final class EmbeddedEngine implements Runnable {
         /**
          * During the engine's {@link EmbeddedEngine#run()} method, call the supplied the supplied function at different
          * stages according to the completion state of each component running within the engine (connectors, tasks etc)
-         * 
+         *
          * @param connectorCallback the callback function; may be null
          * @return this builder object so methods can be chained together; never null
          */
         Builder using(ConnectorCallback connectorCallback);
 
         /**
+         * During the engine's {@link EmbeddedEngine#run()} method, decide when the offsets
+         * should be committed into the {@link OffsetBackingStore}.
+         * @param policy
+         * @return this builder object so methods can be chained together; never null
+         */
+        Builder using(OffsetCommitPolicy policy);
+
+        /**
          * Build a new connector with the information previously supplied to this builder.
-         * 
+         *
          * @return the embedded connector; never null
          * @throws IllegalArgumentException if a {@link #using(Configuration) configuration} or {@link #notifying(Consumer)
          *             consumer function} were not supplied before this method is called
@@ -381,7 +419,7 @@ public final class EmbeddedEngine implements Runnable {
 
     /**
      * Obtain a new {@link Builder} instance that can be used to construct runnable {@link EmbeddedEngine} instances.
-     * 
+     *
      * @return the new builder; never null
      */
     public static Builder create() {
@@ -392,6 +430,7 @@ public final class EmbeddedEngine implements Runnable {
             private Clock clock;
             private CompletionCallback completionCallback;
             private ConnectorCallback connectorCallback;
+            private OffsetCommitPolicy offsetCommitPolicy = null;
 
             @Override
             public Builder using(Configuration config) {
@@ -424,6 +463,12 @@ public final class EmbeddedEngine implements Runnable {
             }
 
             @Override
+            public Builder using(OffsetCommitPolicy offsetCommitPolicy) {
+                this.offsetCommitPolicy = offsetCommitPolicy;
+                return this;
+            }
+
+            @Override
             public Builder notifying(Consumer<SourceRecord> consumer) {
                 this.consumer = consumer;
                 return this;
@@ -435,7 +480,8 @@ public final class EmbeddedEngine implements Runnable {
                 if (clock == null) clock = Clock.system();
                 Objects.requireNonNull(config, "A connector configuration must be specified.");
                 Objects.requireNonNull(consumer, "A connector consumer must be specified.");
-                return new EmbeddedEngine(config, classLoader, clock, consumer, completionCallback, connectorCallback);
+                return new EmbeddedEngine(config, classLoader, clock,
+                        consumer, completionCallback, connectorCallback, offsetCommitPolicy);
             }
 
         };
@@ -456,9 +502,11 @@ public final class EmbeddedEngine implements Runnable {
     private final CompletionResult completionResult;
     private long recordsSinceLastCommit = 0;
     private long timeSinceLastCommitMillis = 0;
+    private OffsetCommitPolicy offsetCommitPolicy;
 
     private EmbeddedEngine(Configuration config, ClassLoader classLoader, Clock clock, Consumer<SourceRecord> consumer,
-                           CompletionCallback completionCallback, ConnectorCallback connectorCallback) {
+                           CompletionCallback completionCallback, ConnectorCallback connectorCallback,
+                           OffsetCommitPolicy offsetCommitPolicy) {
         this.config = config;
         this.consumer = consumer;
         this.classLoader = classLoader;
@@ -468,6 +516,8 @@ public final class EmbeddedEngine implements Runnable {
         };
         this.connectorCallback = connectorCallback;
         this.completionResult = new CompletionResult();
+        this.offsetCommitPolicy = offsetCommitPolicy;
+
         assert this.config != null;
         assert this.consumer != null;
         assert this.classLoader != null;
@@ -492,10 +542,10 @@ public final class EmbeddedEngine implements Runnable {
 
     /**
      * Determine if this embedded connector is currently running.
-     * 
+     *
      * @return {@code true} if running, or {@code false} otherwise
      */
-    protected boolean isRunning() {
+    public boolean isRunning() {
         return this.runningThread.get() != null;
     }
 
@@ -583,8 +633,9 @@ public final class EmbeddedEngine implements Runnable {
                 }
 
                 // Set up the offset commit policy ...
-                long offsetPeriodMs = config.getLong(OFFSET_FLUSH_INTERVAL_MS);
-                OffsetCommitPolicy offsetCommitPolicy = OffsetCommitPolicy.periodic(offsetPeriodMs, TimeUnit.MILLISECONDS);
+                if (offsetCommitPolicy == null) {
+                    offsetCommitPolicy = config.getInstance(EmbeddedEngine.OFFSET_COMMIT_POLICY, OffsetCommitPolicy.class, config);
+                }
 
                 // Initialize the connector using a context that does NOT respond to requests to reconfigure tasks ...
                 ConnectorContext context = new ConnectorContext() {
@@ -755,8 +806,7 @@ public final class EmbeddedEngine implements Runnable {
     protected void maybeFlush(OffsetStorageWriter offsetWriter, OffsetCommitPolicy policy, long commitTimeoutMs,
                               SourceTask task) {
         // Determine if we need to commit to offset storage ...
-        if (policy.performCommit(recordsSinceLastCommit, timeSinceLastCommitMillis,
-                                 TimeUnit.MILLISECONDS)) {
+        if (policy.performCommit(recordsSinceLastCommit, Duration.ofMillis(timeSinceLastCommitMillis))) {
             commitOffsets(offsetWriter, commitTimeoutMs, task);
         }
     }
@@ -805,7 +855,7 @@ public final class EmbeddedEngine implements Runnable {
     /**
      * Stop the execution of this embedded connector. This method does not block until the connector is stopped; use
      * {@link #await(long, TimeUnit)} for this purpose.
-     * 
+     *
      * @return {@code true} if the connector was {@link #run() running} and will eventually stop, or {@code false} if it was not
      *         running when this method is called
      * @see #await(long, TimeUnit)
@@ -827,7 +877,7 @@ public final class EmbeddedEngine implements Runnable {
      * Wait for the connector to complete processing. If the processor is not running, this method returns immediately; however,
      * if the processor is {@link #stop() stopped} and restarted before this method is called, this method will return only
      * when it completes the second time.
-     * 
+     *
      * @param timeout the maximum amount of time to wait before returning
      * @param unit the unit of time; may not be null
      * @return {@code true} if the connector completed within the timeout (or was not running), or {@code false} if it is still
@@ -850,6 +900,8 @@ public final class EmbeddedEngine implements Runnable {
             ConfigDef config = baseConfigDef();
             Field.group(config, "file", OFFSET_STORAGE_FILE_FILENAME);
             Field.group(config, "kafka", OFFSET_STORAGE_KAFKA_TOPIC);
+            Field.group(config, "kafka", OFFSET_STORAGE_KAFKA_PARTITIONS);
+            Field.group(config, "kafka", OFFSET_STORAGE_KAFKA_REPLICATION_FACTOR);
             CONFIG = config;
         }
 

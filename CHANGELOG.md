@@ -2,6 +2,321 @@
 
 All notable changes are documented in this file. Release numbers follow [Semantic Versioning](http://semver.org)
 
+## 0.7.4
+March 7th, 2018 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?projectId=12317320&version=12336214)
+
+### New features since 0.7.3
+
+* Provide MySQL snapshot mode that does not require table locks [DBZ-602](https://issues.jboss.org/browse/DBZ-602)
+* Add support for columns of type "bytea" [DBZ-605](https://issues.jboss.org/browse/DBZ-605)
+* Add string as an option for decimal.handling.mode [DBZ-611](https://issues.jboss.org/browse/DBZ-611)
+* Support CREATE TABLE statements with PARTITION ... ENGINE=InnoDB [DBZ-641](https://issues.jboss.org/browse/DBZ-641)
+* Document VariableScaleDecimal in PG connector docs [DBZ-631](https://issues.jboss.org/browse/DBZ-631)
+* Propagate schema validator by passing AvroValidator instance instead of Function<String, String> [DBZ-626](https://issues.jboss.org/browse/DBZ-626)
+* Move `MAX_QUEUE_SIZE`, `MAX_BATCH_SIZE` and `POLL_INTERVAL_MS` to CommonConnectorConfig [DBZ-628](https://issues.jboss.org/browse/DBZ-628)
+* Unify common start-up logic across connectors [DBZ-630](https://issues.jboss.org/browse/DBZ-630)
+* Removing unused code from database history classes [DBZ-632](https://issues.jboss.org/browse/DBZ-632)
+
+
+### Breaking changes since 0.7.3
+
+`NUMERIC` and geo-spatial schema types were optional regardless of database column configuration. This was fixed in [DBZ-635](https://issues.jboss.org/browse/DBZ-635).
+PostgresSQL decoder plug-in now uses text to transfer decimal values insted of double - [DBZ-351](https://issues.jboss.org/browse/DBZ-351). Debezium is backward compatible with the old version. It is thus necessary first to upgrade Debezium and after that upgrade logical decoder plug-in.
+
+### Fixes and changes since 0.7.3
+
+* Numeric datatype is transferred with lost precision [DBZ-351](https://issues.jboss.org/browse/DBZ-351)
+* Cannot Serialize NaN value(numeric field) in Postgres [DBZ-606](https://issues.jboss.org/browse/DBZ-606)
+* Decimal datatype DDL issues [DBZ-615](https://issues.jboss.org/browse/DBZ-615)
+* Avoid NPE if `confirmed_flush_lsn` is null [DBZ-623](https://issues.jboss.org/browse/DBZ-623)
+* REAL column values are omitted if value is an exact integer [DBZ-625](https://issues.jboss.org/browse/DBZ-625)
+* Fix intermittent error in BinlogReaderIT [DBZ-629](https://issues.jboss.org/browse/DBZ-629)
+* Schema for NUMERIC and geo-spatial array columns shouldn't be optional by default [DBZ-635](https://issues.jboss.org/browse/DBZ-635)
+* Fix typo in README of debezium/connect-base image [DBZ-636](https://issues.jboss.org/browse/DBZ-636)
+* Avoid repeated creation of Envelope schema [DBZ-620](https://issues.jboss.org/browse/DBZ-620)
+
+
+## 0.7.3
+February 14th, 2018 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?projectId=12317320&version=12336643)
+
+### New features since 0.7.2
+
+* MySQL connector should automatically create database history topic [DBZ-278](https://issues.jboss.org/browse/DBZ-278)
+* Change OpenShift instructions to use Strimzi [DBZ-545](https://issues.jboss.org/browse/DBZ-545)
+* Create an internal namespace for configuration options not intended for general usage [DBZ-576](https://issues.jboss.org/browse/DBZ-576)
+* Make ChainedReader immutable [DBZ-583](https://issues.jboss.org/browse/DBZ-583)
+* Snapshots are not interruptable with the Postgres connector [DBZ-586](https://issues.jboss.org/browse/DBZ-586)
+* Add optional field with Debezium version to "source" element of messages [DBZ-593](https://issues.jboss.org/browse/DBZ-593)
+* Add the ability to control the strategy for committing offsets by the offset store [DBZ-537](https://issues.jboss.org/browse/DBZ-537)
+* Create support for arrays of PostGIS types [DBZ-571](https://issues.jboss.org/browse/DBZ-571)
+* Add option for controlling whether to produce tombstone records on DELETE operations [DBZ-582](https://issues.jboss.org/browse/DBZ-582)
+* Add example for using the MongoDB event flattening SMT [DBZ-567](https://issues.jboss.org/browse/DBZ-567)
+* Prefix the names of all threads spawned by Debezium with "debezium-" [DBZ-587](https://issues.jboss.org/browse/DBZ-587)
+
+
+### Breaking changes since 0.7.2
+
+A new namespace for parameters was [created](https://issues.jboss.org/browse/DBZ-576) - `internal` - that is used for parameters that are not documented and should not be used as they are subject of changes without warning. As a result of this change the undocumented parameter `database.history.ddl.filter` was renamed to `internal.database.history.ddl.filter`.
+
+OpenShift deployment now uses templates and images from [Strimzi project](https://issues.jboss.org/browse/DBZ-545).
+
+
+### Fixes and changes since 0.7.2
+
+* Force DBZ to commit regularly [DBZ-220](https://issues.jboss.org/browse/DBZ-220)
+* Carry over SourceInfo.restartEventsToSkip to next binlog file handling cause binlog events are not written to kafka [DBZ-572](https://issues.jboss.org/browse/DBZ-572)
+* Numeric arrays not handled correctly [DBZ-577](https://issues.jboss.org/browse/DBZ-577)
+* Debezium skipping binlog events silently [DBZ-588](https://issues.jboss.org/browse/DBZ-588)
+* Stop the connector if WALs to continue from aren't available [DBZ-590](https://issues.jboss.org/browse/DBZ-590)
+* Producer thread of DB history topic leaks after connector shut-down [DBZ-595](https://issues.jboss.org/browse/DBZ-595)
+* Integration tests should have completely isolated environment and configuration/setup files [DBZ-300](https://issues.jboss.org/browse/DBZ-300)
+* MongoDB integration tests should have completely isolated environment and configuration/setup files [DBZ-579](https://issues.jboss.org/browse/DBZ-579)
+* Extract a separate change event class to be re-used across connectors [DBZ-580](https://issues.jboss.org/browse/DBZ-580)
+* Propagate producer errors to Kafka Connect in MongoDB connector [DBZ-581](https://issues.jboss.org/browse/DBZ-581)
+* Shutdown thread pool used for MongoDB snaphots once it's not needed anymore [DBZ-594](https://issues.jboss.org/browse/DBZ-594)
+* Refactor type and array handling for Postgres [DBZ-609](https://issues.jboss.org/browse/DBZ-609)
+* Avoid unneccessary schema refreshs [DBZ-616](https://issues.jboss.org/browse/DBZ-616)
+* Incorrect type retrieved by stream producer for column TIMESTAMP (0) WITH TIME ZONE [DBZ-618](https://issues.jboss.org/browse/DBZ-618)
+
+
+## 0.7.2
+January 25th, 2018 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12336456&projectId=12317320)
+
+### New features since 0.7.1
+
+* As a Debezium user, I would like MySQL Connector to support 'Spatial' data types [DBZ-208](https://issues.jboss.org/browse/DBZ-208)
+* Allow easy consumption of MongoDB CDC events by other connectors [DBZ-409](https://issues.jboss.org/browse/DBZ-409)
+* New snapshotting mode for recovery of DB history topic [DBZ-443](https://issues.jboss.org/browse/DBZ-443)
+* Add support for Postgres VARCHAR array columns [DBZ-506](https://issues.jboss.org/browse/DBZ-506)
+* Unified Geometry type support [DBZ-507](https://issues.jboss.org/browse/DBZ-507)
+* Add support for "snapshot.select.statement.overrides" option for Postgres [DBZ-510](https://issues.jboss.org/browse/DBZ-510)
+* Make PostGIS optional in Postgres Docker images [DBZ-526](https://issues.jboss.org/browse/DBZ-526)
+* Provide an option to only store DDL statements referring to captured tables in DB history topic [DBZ-541](https://issues.jboss.org/browse/DBZ-541)
+* Add ToC to tutorial and make section captions linkable [DBZ-369](https://issues.jboss.org/browse/DBZ-369)
+* Remove Zulu JDK images [DBZ-449](https://issues.jboss.org/browse/DBZ-449)
+* Add example for sending CDC events to Elasticsearch [DBZ-502](https://issues.jboss.org/browse/DBZ-502)
+* Adapt examples to MongoDB 3.6 [DBZ-509](https://issues.jboss.org/browse/DBZ-509)
+* Backport add-ons definition from add-ons repo [DBZ-520](https://issues.jboss.org/browse/DBZ-520)
+* Set up pull request build job for testing the PG connector with wal2json [DBZ-568](https://issues.jboss.org/browse/DBZ-568)
+
+
+### Breaking changes since 0.7.1
+
+There are no breaking changes in this release.
+
+
+### Fixes and changes since 0.7.1
+
+* Debezium MySQL connector only works for lower-case table names on case-insensitive file systems [DBZ-392](https://issues.jboss.org/browse/DBZ-392)
+* Numbers after decimal point are different between source and destination [DBZ-423](https://issues.jboss.org/browse/DBZ-423)
+* Fix support for date arrays [DBZ-494](https://issues.jboss.org/browse/DBZ-494)
+* Changes in type contraints will not trigger new schema [DBZ-504](https://issues.jboss.org/browse/DBZ-504)
+* Task is still running after connector is paused [DBZ-516](https://issues.jboss.org/browse/DBZ-516)
+* NPE happened for PAUSED task [DBZ-519](https://issues.jboss.org/browse/DBZ-519)
+* Possibility of commit LSN before record is consumed/notified [DBZ-521](https://issues.jboss.org/browse/DBZ-521)
+* Snapshot fails when encountering null MySQL TIME fields [DBZ-522](https://issues.jboss.org/browse/DBZ-522)
+* Debezium unable to parse DDLs in MySql with RESTRICT contstraint [DBZ-524](https://issues.jboss.org/browse/DBZ-524)
+* DateTimeFormatter Exception in wal2json [DBZ-525](https://issues.jboss.org/browse/DBZ-525)
+* Multiple partitions does not work in ALTER TABLE [DBZ-530](https://issues.jboss.org/browse/DBZ-530)
+* Incorrect lookup in List in MySqlDdlParser.parseCreateView [DBZ-534](https://issues.jboss.org/browse/DBZ-534)
+* Improve invalid DDL statement logging [DBZ-538](https://issues.jboss.org/browse/DBZ-538)
+* Fix required protobuf version in protobuf decoder documentation [DBZ-542](https://issues.jboss.org/browse/DBZ-542)
+* EmbeddedEngine strips settings required to use KafkaOffsetBackingStore [DBZ-555](https://issues.jboss.org/browse/DBZ-555)
+* Handling of date arrays collides with handling of type changes via wal2json [DBZ-558](https://issues.jboss.org/browse/DBZ-558)
+* ROLLBACK to savepoint cannot be parsed [DBZ-411](https://issues.jboss.org/browse/DBZ-411)
+* Avoid usage of deprecated numeric types constructors [DBZ-455](https://issues.jboss.org/browse/DBZ-455)
+* Don't add source and JavaDoc JARs to Kafka image [DBZ-489](https://issues.jboss.org/browse/DBZ-489)
+
+
+## 0.7.1
+December 20th, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12336215&projectId=12317320)
+
+### New features since 0.7.0
+
+* Provide a wal2json plug-in mode enforcing RDS environment [DBZ-517](https://issues.jboss.org/browse/DBZ-517)
+
+
+### Breaking changes since 0.7.0
+
+There are no breaking changes in this release.
+
+
+### Fixes and changes since 0.7.0
+
+* For old connector OID should be used to detect schema change [DBZ-512](https://issues.jboss.org/browse/DBZ-512)
+* AWS RDS Postgresql 9.6.5 not supporting "include-not-null" = "true" in connector setup [DBZ-513](https://issues.jboss.org/browse/DBZ-513)
+* RecordsStreamProducerIT.shouldNotStartAfterStop can make subsequent test dependent [DBZ-518](https://issues.jboss.org/browse/DBZ-518)
+
+
+## 0.7.0
+December 15th, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12335366&projectId=12317320)
+
+### New features since 0.6.2
+
+* PostgreSQL connector should work on Amazon RDS and be able to use the available plugin [DBZ-256](https://issues.jboss.org/browse/DBZ-256)
+* Build Debezium against Kafka 1.0.0 [DBZ-432](https://issues.jboss.org/browse/DBZ-432)
+* Build Debezium images with Kafka 1.0.0 [DBZ-433](https://issues.jboss.org/browse/DBZ-433)
+* Protobuf message should contain type modifiers [DBZ-485](https://issues.jboss.org/browse/DBZ-485)
+* Protobuf message should contain optional flags [DBZ-486](https://issues.jboss.org/browse/DBZ-486)
+* Better support for large append-only tables by making the snapshotting process restartable [DBZ-349](https://issues.jboss.org/browse/DBZ-349)
+* Support new wal2json type specifiers [DBZ-453](https://issues.jboss.org/browse/DBZ-453)
+* Optionally return raw value for unsupported column types [DBZ-498](https://issues.jboss.org/browse/DBZ-498)
+* Provide Postgres example image for 0.7 [DBZ-382](https://issues.jboss.org/browse/DBZ-382)
+* Create an automated build for Postgres example image in Docker Hub [DBZ-383](https://issues.jboss.org/browse/DBZ-383)
+* Move configuration of ProtoBuf code generation to Postgres module [DBZ-416](https://issues.jboss.org/browse/DBZ-416)
+* Provide MongoDB example image for Debezium 0.7 [DBZ-451](https://issues.jboss.org/browse/DBZ-451)
+* Upgrade to Confluent Platform 4.0 [DBZ-492](https://issues.jboss.org/browse/DBZ-492)
+* Set up CI job for testing Postgres with new wal2json type identifiers [DBZ-495](https://issues.jboss.org/browse/DBZ-495)
+* Change PostgreSQL connector to support multiple plugins [DBZ-257](https://issues.jboss.org/browse/DBZ-257)
+* PostgreSQL connector should support the wal2json logical decoding plugin [DBZ-258](https://issues.jboss.org/browse/DBZ-258)
+* Provide instructions for using Debezium on Minishift [DBZ-364](https://issues.jboss.org/browse/DBZ-364)
+* Modify BinlogReader to process transactions via buffer [DBZ-405](https://issues.jboss.org/browse/DBZ-405)
+* Modify BinlogReader to support transactions of unlimited size [DBZ-406](https://issues.jboss.org/browse/DBZ-406)
+
+
+### Breaking changes since 0.6.2
+
+This release includes the following changes that can affect existing installations
+
+* Change default setting for BIGINT UNSIGNED handling [DBZ-461](https://issues.jboss.org/browse/DBZ-461)
+* Invalid value for HourOfDay ConnectException when the value of MySQL TIME filed is above 23:59:59 [DBZ-342](https://issues.jboss.org/browse/DBZ-342)
+* Postgres connectors stops to work after concurrent schema changes and updates [DBZ-379](https://issues.jboss.org/browse/DBZ-379)
+* Hardcoded schema version overrides schema registry version [DBZ-466](https://issues.jboss.org/browse/DBZ-466)
+
+
+### Fixes and changes since 0.6.2
+
+* Data are read from the binlog and not written into Kafka [DBZ-390](https://issues.jboss.org/browse/DBZ-390)
+* MySQL connector may not read database history to end [DBZ-464](https://issues.jboss.org/browse/DBZ-464)
+* connect-base image advertises wrong port by default [DBZ-467](https://issues.jboss.org/browse/DBZ-467)
+* INSERT statements being written to db history topic [DBZ-469](https://issues.jboss.org/browse/DBZ-469)
+* MySQL Connector does not handle properly startup/shutdown [DBZ-473](https://issues.jboss.org/browse/DBZ-473)
+* Cannot parse NOT NULL COLLATE in DDL [DBZ-474](https://issues.jboss.org/browse/DBZ-474)
+* Failed to parse the sql statement of RENAME user [DBZ-475](https://issues.jboss.org/browse/DBZ-475)
+* Exception when parsing enum field with escaped characters values [DBZ-476](https://issues.jboss.org/browse/DBZ-476)
+* All to insert null value into numeric array columns [DBZ-478](https://issues.jboss.org/browse/DBZ-478)
+* produceStrings method slow down on sending messages [DBZ-479](https://issues.jboss.org/browse/DBZ-479)
+* Failing unit tests when run in EST timezone [DBZ-491](https://issues.jboss.org/browse/DBZ-491)
+* PostgresConnector falls with RejectedExecutionException [DBZ-501](https://issues.jboss.org/browse/DBZ-501)
+* Docker images cannot be re-built when a new version of ZooKeeper/Kafka is released [DBZ-503](https://issues.jboss.org/browse/DBZ-503)
+* Insert ids as long instead of float for MongoDB example image [DBZ-470](https://issues.jboss.org/browse/DBZ-470)
+* Port changes in 0.6 Docker files into 0.7 files [DBZ-463](https://issues.jboss.org/browse/DBZ-463)
+* Add check to release process to make sure all issues are assigned to a component [DBZ-468](https://issues.jboss.org/browse/DBZ-468)
+* Document requirement for database history topic to be not partitioned [DBZ-482](https://issues.jboss.org/browse/DBZ-482)
+* Remove dead code from MySqlSchema [DBZ-483](https://issues.jboss.org/browse/DBZ-483)
+* Remove redundant calls to pfree [DBZ-496](https://issues.jboss.org/browse/DBZ-496)
+
+
+## 0.6.2
+November 15th, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12335989&projectId=12317320)
+
+### New features since 0.6.1
+
+* Log current position in MySQL binlog to simplify debugging [DBZ-401](https://issues.jboss.org/projects/DBZ/issues/DBZ-401)
+* Support PostgreSQL 10 [DBZ-424](https://issues.jboss.org/projects/DBZ/issues/DBZ-424)
+* Create a Docker image for PostgreSQL 10 [DBZ-426](https://issues.jboss.org/projects/DBZ/issues/DBZ-426)
+* Add example for using Avro messages [DBZ-430](https://issues.jboss.org/projects/DBZ/issues/DBZ-430)
+* Make postGIS dependency optional [DBZ-445](https://issues.jboss.org/projects/DBZ/issues/DBZ-445)
+* Avro console-consumer example in docs [DBZ-458](https://issues.jboss.org/projects/DBZ/issues/DBZ-458)
+* Docker micro version tags (e.g., 0.6.1) [DBZ-418](https://issues.jboss.org/projects/DBZ/issues/DBZ-418)
+* Create a CI job for testing with PostgreSQL 10 [DBZ-427](https://issues.jboss.org/projects/DBZ/issues/DBZ-427)
+* Upgrade dependencies in Docker images to match Kafka 0.11.0.1 [DBZ-450](https://issues.jboss.org/projects/DBZ/issues/DBZ-450)
+
+
+### Breaking changes since 0.6.1
+
+* Timestamp field not handle time zone correctly [DBZ-260](https://issues.jboss.org/projects/DBZ/issues/DBZ-260)
+  * This issue finally fixes a long standing bug in timestamp timezone handling. If there is a client that was depending on this bug to provide value without the correct offset then it has to be fixed.
+
+
+### Fixes and changes since 0.6.1
+
+* Connector fails and stops when coming across corrupt event [DBZ-217](https://issues.jboss.org/projects/DBZ/issues/DBZ-217)
+* [Postgres] Interval column causes exception during handling of DELETE [DBZ-259](https://issues.jboss.org/projects/DBZ/issues/DBZ-259)
+* The scope of the Kafka Connect dependency should be "provided" [DBZ-285](https://issues.jboss.org/projects/DBZ/issues/DBZ-285)
+* KafkaCluster#withKafkaConfiguration() does not work [DBZ-323](https://issues.jboss.org/projects/DBZ/issues/DBZ-323)
+* MySQL connector "initial_only" snapshot mode results in CPU spike from ConnectorTask polling [DBZ-396](https://issues.jboss.org/projects/DBZ/issues/DBZ-396)
+* Allow to omit COLUMN word in ALTER TABLE MODIFY/ALTER/CHANGE [DBZ-412](https://issues.jboss.org/projects/DBZ/issues/DBZ-412)
+* MySQL connector should handle stored procedure definitions [DBZ-415](https://issues.jboss.org/projects/DBZ/issues/DBZ-415)
+* Support constraints without name in DDL statement [DBZ-419](https://issues.jboss.org/projects/DBZ/issues/DBZ-419)
+* Short field not null throw an exception [DBZ-422](https://issues.jboss.org/projects/DBZ/issues/DBZ-422)
+* ALTER TABLE cannot change default value of column [DBZ-425](https://issues.jboss.org/projects/DBZ/issues/DBZ-425)
+* DDL containing text column with length specification cannot be parsed [DBZ-428](https://issues.jboss.org/projects/DBZ/issues/DBZ-428)
+* Integer column with negative default value causes MySQL connector to crash [DBZ-429](https://issues.jboss.org/projects/DBZ/issues/DBZ-429)
+* MySQL procedure parser handles strings and keywords as same tokens [DBZ-437](https://issues.jboss.org/projects/DBZ/issues/DBZ-437)
+* Mongo initial sync misses records with initial.sync.max.threads > 1 [DBZ-438](https://issues.jboss.org/projects/DBZ/issues/DBZ-438)
+* Can't parse DDL containing PRECISION clause without parameters [DBZ-439](https://issues.jboss.org/projects/DBZ/issues/DBZ-439)
+* Task restart triggers MBean to register twice [DBZ-447](https://issues.jboss.org/projects/DBZ/issues/DBZ-447)
+* Remove slowness in KafkaDatabaseHistoryTest [DBZ-456](https://issues.jboss.org/projects/DBZ/issues/DBZ-456)
+
+
+## 0.6.1
+October 26th, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12335619&projectId=12317320)
+
+### New features since 0.6.0
+
+* Support for UNSIGNED BIGINT to not be treated as byte[] [DBZ-363](https://issues.jboss.org/projects/DBZ/issues/DBZ-363)
+* Make Debezium build on Java 9 [DBZ-227](https://issues.jboss.org/projects/DBZ/issues/DBZ-227)
+* Add a test for "PAGE_CHECKSUM" DDL option [DBZ-336](https://issues.jboss.org/projects/DBZ/issues/DBZ-336)
+* Provide tutorial Docker Compose files for MongoDB and Postgres [DBZ-361](https://issues.jboss.org/projects/DBZ/issues/DBZ-361)
+* Upgrade to latest Kafka 0.11.x [DBZ-367](https://issues.jboss.org/projects/DBZ/issues/DBZ-367)
+* Prevent warning when building the plug-ins [DBZ-370](https://issues.jboss.org/projects/DBZ/issues/DBZ-370)
+* Replace hard-coded version references with variables [DBZ-371](https://issues.jboss.org/projects/DBZ/issues/DBZ-371)
+* Upgrade to latest version of mysql-binlog-connector-java [DBZ-398](https://issues.jboss.org/projects/DBZ/issues/DBZ-398)
+* Create wal2json CI job [DBZ-403](https://issues.jboss.org/projects/DBZ/issues/DBZ-403)
+* Travis jobs tests are failing due to Postgres [DBZ-404](https://issues.jboss.org/projects/DBZ/issues/DBZ-404)
+
+
+### Breaking changes since 0.6.0
+
+There should be no breaking changes in this relese.
+
+
+### Fixes and changes since 0.6.0
+
+* Avoid NullPointerException when closing MySQL connector after another error [DBZ-378](https://issues.jboss.org/projects/DBZ/issues/DBZ-378)
+* RecordsStreamProducer#streamChanges() can die on an exception without failing the connector [DBZ-380](https://issues.jboss.org/projects/DBZ/issues/DBZ-380)
+* Encoding to JSON does not support all MongoDB types [DBZ-385](https://issues.jboss.org/projects/DBZ/issues/DBZ-385)
+* MySQL connector does not filter out DROP TEMP TABLE statements from DB history topic [DBZ-395](https://issues.jboss.org/projects/DBZ/issues/DBZ-395)
+* Binlog Reader is registering MXBean when using "initial_only" snapshot mode [DBZ-402](https://issues.jboss.org/projects/DBZ/issues/DBZ-402)
+* A column named `column`, even when properly escaped, causes exception [DBZ-408](https://issues.jboss.org/projects/DBZ/issues/DBZ-408)
+
+
+## 0.6.0
+September 21st, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12331386&projectId=12317320)
+
+### New features since 0.5.2
+
+* Use new Kafka 0.10 properties for listeners and advertised listeners [DBZ-39](https://issues.jboss.org/projects/DBZ/issues/DBZ-39)
+* Add docker-compose handling for Debezium tutorial [DBZ-127](https://issues.jboss.org/projects/DBZ/issues/DBZ-127)
+* Topic configuration requirements are not clearly documented [DBZ-241](https://issues.jboss.org/projects/DBZ/issues/DBZ-241)
+* Upgrade Docker images to Kafka 0.11.0.0 [DBZ-305](https://issues.jboss.org/projects/DBZ/issues/DBZ-305)
+* Add SMT implementation to convert CDC event structure to more traditional row state structure [DBZ-226](https://issues.jboss.org/projects/DBZ/issues/DBZ-226)
+* Support SSL connection to Mongodb [DBZ-343](https://issues.jboss.org/projects/DBZ/issues/DBZ-343)
+* Support DEC and FIXED type for mysql ddl parser [DBZ-359](https://issues.jboss.org/projects/DBZ/issues/DBZ-359)
+
+
+### Breaking changes since 0.5.2
+
+This release includes the following change that affects existing installations that captures MongoDB
+
+* Add support for different mongodb _id types in key struct [DBZ-306](https://issues.jboss.org/projects/DBZ/issues/DBZ-306)
+
+
+### Fixes and changes since 0.5.2
+
+* MySQL snapshotter is not guaranteed to give a consistent snapshot [DBZ-210](https://issues.jboss.org/projects/DBZ/issues/DBZ-210)
+* MySQL connector stops consuming data from binlog after server restart [DBZ-219](https://issues.jboss.org/projects/DBZ/issues/DBZ-219)
+* Warnings and notifications from PostgreSQL are ignored by the connector [DBZ-279](https://issues.jboss.org/projects/DBZ/issues/DBZ-279)
+* BigDecimal has mismatching scale value for given Decimal schema error. [DBZ-318](https://issues.jboss.org/projects/DBZ/issues/DBZ-318)
+* Views in database stop PostgreSQL connector [DBZ-319](https://issues.jboss.org/projects/DBZ/issues/DBZ-319)
+* Don't pass database history properties to the JDBC connection [DBZ-333](https://issues.jboss.org/projects/DBZ/issues/DBZ-333)
+* Sanitize readings from database history topic [DBZ-341](https://issues.jboss.org/projects/DBZ/issues/DBZ-341)
+* Support UNION for ALTER TABLE [DBZ-346](https://issues.jboss.org/projects/DBZ/issues/DBZ-346)
+* Debezium fails to start when schema history topic contains unparseable SQL [DBZ-347](https://issues.jboss.org/projects/DBZ/issues/DBZ-347)
+* JDBC Connection is not closed after schema refresh [DBZ-356](https://issues.jboss.org/projects/DBZ/issues/DBZ-356)
+* MySQL integration tests should have completely isolated environment and configuration/setup files [DBZ-304](https://issues.jboss.org/projects/DBZ/issues/DBZ-304)
+
 ## 0.5.2
 
 August 17, 2017 [Detailed release notes](https://issues.jboss.org/secure/ReleaseNote.jspa?version=12334601&projectId=12317320)
@@ -17,7 +332,7 @@ August 17, 2017 [Detailed release notes](https://issues.jboss.org/secure/Release
 
 ### Breaking changes since 0.5.1
 
-There should be no breaking changes in this relese.
+There should be no breaking changes in this release.
 
 ### Fixes and changes since 0.5.1
 

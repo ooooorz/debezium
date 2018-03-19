@@ -10,9 +10,8 @@ import java.sql.SQLException;
 import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.function.Function;
+import java.util.Set;
 import java.util.function.Predicate;
-import java.util.stream.Stream;
 
 import org.apache.kafka.connect.data.Schema;
 import org.slf4j.Logger;
@@ -27,7 +26,7 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
 import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.Tables;
-import io.debezium.util.AvroValidator;
+import io.debezium.util.SchemaNameAdjuster;
 
 /**
  * Component that records the schema information for the {@link PostgresConnector}. The schema information contains
@@ -48,23 +47,27 @@ public class PostgresSchema {
     private final TableSchemaBuilder schemaBuilder;
     private final String schemaPrefix;
     private final Tables tables;
-    private final Function<String, String> schemaNameValidator;
+    private final SchemaNameAdjuster schemaNameAdjuster;
+    private final PostgresValueConverter valueConverter;
 
     private Map<String, Integer> typeInfo;
+    private final TypeRegistry typeRegistry;
+    private final TopicSelector topicSelector;
 
     /**
      * Create a schema component given the supplied {@link PostgresConnectorConfig Postgres connector configuration}.
      *
      * @param config the connector configuration, which is presumed to be valid
      */
-    protected PostgresSchema(PostgresConnectorConfig config) {
+    protected PostgresSchema(PostgresConnectorConfig config, TypeRegistry typeRegistry, TopicSelector topicSelector) {
         this.filters = new Filters(config);
         this.tables = new Tables();
+        this.topicSelector = topicSelector;
 
-        PostgresValueConverter valueConverter = new PostgresValueConverter(config.decimalHandlingMode(), config.adaptiveTimePrecision(),
-                ZoneOffset.UTC);
-        this.schemaNameValidator = AvroValidator.create(LOGGER)::validate;
-        this.schemaBuilder = new TableSchemaBuilder(valueConverter, this.schemaNameValidator);
+        this.valueConverter = new PostgresValueConverter(config.decimalHandlingMode(), config.temporalPrecisionMode(),
+                ZoneOffset.UTC, null, config.includeUnknownDatatypes(), typeRegistry);
+        this.schemaNameAdjuster = SchemaNameAdjuster.create(LOGGER);
+        this.schemaBuilder = new TableSchemaBuilder(valueConverter, this.schemaNameAdjuster, SourceInfo.SCHEMA);
 
         // Set up the server name and schema prefix ...
         String serverName = config.serverName();
@@ -74,6 +77,7 @@ public class PostgresSchema {
             serverName = serverName.trim();
             this.schemaPrefix = serverName.endsWith(".") || serverName.isEmpty() ? serverName : serverName + ".";
         }
+        this.typeRegistry = typeRegistry;
     }
 
     /**
@@ -130,6 +134,18 @@ public class PostgresSchema {
     }
 
     /**
+     * Refreshes the schema content with a table constructed externally
+     *
+     * @param table constructed externally - typically from decoder metadata
+     */
+    protected void refresh(Table table) {
+        // overwrite (add or update) or views of the tables
+        tables.overwriteTable(table);
+        // and refresh the schema
+        refreshSchema(table.id());
+    }
+
+    /**
      * Get the {@link Filters database and table filters} defined by the configuration.
      *
      * @return the filters; never null
@@ -150,8 +166,8 @@ public class PostgresSchema {
         return filters.tableFilter().test(id) ? tables.forTable(id) : null;
     }
 
-    protected String validateSchemaName(String name) {
-        return this.schemaNameValidator.apply(name);
+    protected String adjustSchemaName(String name) {
+        return this.schemaNameAdjuster.adjust(name);
     }
 
     protected TableSchema schemaFor(TableId id) {
@@ -162,16 +178,16 @@ public class PostgresSchema {
         return !filters.tableFilter().test(id);
     }
 
-    protected boolean isType(String localTypeName, int jdbcType) {
-        return typeInfo != null && Integer.compare(jdbcType, columnTypeNameToPgOid(localTypeName)) == 0;
+    protected boolean isJdbcType(String localTypeName, int jdbcType) {
+        return typeInfo != null && columnTypeNameToJdbcTypeId(localTypeName) == jdbcType;
     }
 
-    protected int columnTypeNameToPgOid(String localTypeName) {
+    protected int columnTypeNameToJdbcTypeId(String localTypeName) {
         return typeInfo.get(localTypeName);
     }
 
-    protected Stream<TableId> tables() {
-        return tables.tableIds().stream();
+    protected Set<TableId> tables() {
+        return tables.tableIds();
     }
 
     /**
@@ -188,8 +204,12 @@ public class PostgresSchema {
             LOGGER.debug("refreshing DB schema for table '{}'", id);
         }
         Table table = this.tables.forTable(id);
-        TableSchema schema = schemaBuilder.create(schemaPrefix, table, filters.columnFilter(), null);
+        TableSchema schema = schemaBuilder.create(schemaPrefix, getEnvelopeSchemaName(table), table, filters.columnFilter(), null);
         tableSchemaByTableId.put(id, schema);
+    }
+
+    private String getEnvelopeSchemaName(Table table) {
+        return topicSelector.topicNameFor(table.id()) + ".Envelope";
     }
 
     protected static TableId parse(String table) {
@@ -198,5 +218,9 @@ public class PostgresSchema {
             return null;
         }
         return tableId.schema() == null ? new TableId(tableId.catalog(), PUBLIC_SCHEMA_NAME, tableId.table()) : tableId;
+    }
+
+    public TypeRegistry getTypeRegistry() {
+        return typeRegistry;
     }
 }

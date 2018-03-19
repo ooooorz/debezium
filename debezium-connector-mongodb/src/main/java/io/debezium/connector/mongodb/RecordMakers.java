@@ -16,25 +16,30 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.bson.Document;
 import org.bson.json.JsonMode;
 import org.bson.json.JsonWriterSettings;
-import org.bson.types.ObjectId;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.mongodb.DBCollection;
+import com.mongodb.MongoClient;
+import com.mongodb.util.JSONSerializers;
+import com.mongodb.util.ObjectSerializer;
 
 import io.debezium.annotation.ThreadSafe;
 import io.debezium.data.Envelope.FieldName;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.data.Json;
 import io.debezium.function.BlockingConsumer;
-import io.debezium.util.AvroValidator;
+import io.debezium.util.SchemaNameAdjuster;
 
 /**
  * A component that makes {@link SourceRecord}s for {@link CollectionId collections} and submits them to a consumer.
- * 
+ *
  * @author Randall Hauch
  */
 @ThreadSafe
 public class RecordMakers {
 
+    private static final ObjectSerializer jsonSerializer = JSONSerializers.getStrict();
     private static final Map<String, Operation> operationLiterals = new HashMap<>();
     static {
         operationLiterals.put("i", Operation.CREATE);
@@ -43,38 +48,40 @@ public class RecordMakers {
     }
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
-    private final AvroValidator schemaNameValidator = AvroValidator.create(logger);
+    private final SchemaNameAdjuster schemaNameAdjuster = SchemaNameAdjuster.create(logger);
     private final SourceInfo source;
     private final TopicSelector topicSelector;
     private final Map<CollectionId, RecordsForCollection> recordMakerByCollectionId = new HashMap<>();
     private final Function<Document, String> valueTransformer;
     private final BlockingConsumer<SourceRecord> recorder;
+    private final boolean emitTombstonesOnDelete;
 
     /**
      * Create the record makers using the supplied components.
-     * 
+     *
      * @param source the connector's source information; may not be null
      * @param topicSelector the selector for topic names; may not be null
      * @param recorder the potentially blocking consumer function to be called for each generated record; may not be null
      */
-    public RecordMakers(SourceInfo source, TopicSelector topicSelector, BlockingConsumer<SourceRecord> recorder) {
+    public RecordMakers(SourceInfo source, TopicSelector topicSelector, BlockingConsumer<SourceRecord> recorder, boolean emitTombstonesOnDelete) {
         this.source = source;
         this.topicSelector = topicSelector;
         JsonWriterSettings writerSettings = new JsonWriterSettings(JsonMode.STRICT, "", ""); // most compact JSON
         this.valueTransformer = (doc) -> doc.toJson(writerSettings);
         this.recorder = recorder;
+        this.emitTombstonesOnDelete = emitTombstonesOnDelete;
     }
 
     /**
      * Obtain the record maker for the given table, using the specified columns and sending records to the given consumer.
-     * 
+     *
      * @param collectionId the identifier of the collection for which records are to be produced; may not be null
      * @return the table-specific record maker; may be null if the table is not included in the connector
      */
     public RecordsForCollection forCollection(CollectionId collectionId) {
         return recordMakerByCollectionId.computeIfAbsent(collectionId, id -> {
             String topicName = topicSelector.getTopic(collectionId);
-            return new RecordsForCollection(collectionId, source, topicName, schemaNameValidator, valueTransformer, recorder);
+            return new RecordsForCollection(collectionId, source, topicName, schemaNameAdjuster, valueTransformer, recorder, emitTombstonesOnDelete);
         });
     }
 
@@ -91,20 +98,21 @@ public class RecordMakers {
         private final Schema valueSchema;
         private final Function<Document, String> valueTransformer;
         private final BlockingConsumer<SourceRecord> recorder;
+        private final boolean emitTombstonesOnDelete;
 
-        protected RecordsForCollection(CollectionId collectionId, SourceInfo source, String topicName, AvroValidator validator,
-                Function<Document, String> valueTransformer, BlockingConsumer<SourceRecord> recorder) {
+        protected RecordsForCollection(CollectionId collectionId, SourceInfo source, String topicName, SchemaNameAdjuster adjuster,
+                Function<Document, String> valueTransformer, BlockingConsumer<SourceRecord> recorder, boolean emitTombstonesOnDelete) {
             this.sourcePartition = source.partition(collectionId.replicaSetName());
             this.collectionId = collectionId;
             this.replicaSetName = this.collectionId.replicaSetName();
             this.source = source;
             this.topicName = topicName;
             this.keySchema = SchemaBuilder.struct()
-                                          .name(validator.validate(topicName + ".Key"))
-                                          .field("_id", Schema.STRING_SCHEMA)
+                                          .name(adjuster.adjust(topicName + ".Key"))
+                                          .field("id", Schema.STRING_SCHEMA)
                                           .build();
             this.valueSchema = SchemaBuilder.struct()
-                                            .name(validator.validate(topicName + ".Envelope"))
+                                            .name(adjuster.adjust(topicName + ".Envelope"))
                                             .field(FieldName.AFTER, Json.builder().optional().build())
                                             .field("patch", Json.builder().optional().build())
                                             .field(FieldName.SOURCE, source.schema())
@@ -112,13 +120,14 @@ public class RecordMakers {
                                             .field(FieldName.TIMESTAMP, Schema.OPTIONAL_INT64_SCHEMA)
                                             .build();
             JsonWriterSettings writerSettings = new JsonWriterSettings(JsonMode.STRICT, "", ""); // most compact JSON
-            this.valueTransformer = (doc) -> doc.toJson(writerSettings);
+            this.valueTransformer = (doc) -> doc.toJson(writerSettings, MongoClient.getDefaultCodecRegistry().get(Document.class));
             this.recorder = recorder;
+            this.emitTombstonesOnDelete = emitTombstonesOnDelete;
         }
 
         /**
          * Get the identifier of the collection to which this producer applies.
-         * 
+         *
          * @return the collection ID; never null
          */
         public CollectionId collectionId() {
@@ -127,7 +136,7 @@ public class RecordMakers {
 
         /**
          * Generate and record one or more source records to describe the given object.
-         * 
+         *
          * @param id the identifier of the collection in which the document exists; may not be null
          * @param object the document; may not be null
          * @param timestamp the timestamp at which this operation is occurring
@@ -138,13 +147,13 @@ public class RecordMakers {
         public int recordObject(CollectionId id, Document object, long timestamp) throws InterruptedException {
             final Struct sourceValue = source.lastOffsetStruct(replicaSetName, id);
             final Map<String, ?> offset = source.lastOffset(replicaSetName);
-            String objId = objectIdLiteralFrom(object);
+            String objId = idObjToJson(object);
+            assert objId != null;
             return createRecords(sourceValue, offset, Operation.READ, objId, object, timestamp);
         }
-
         /**
          * Generate and record one or more source records to describe the given event.
-         * 
+         *
          * @param oplogEvent the event; may not be null
          * @param timestamp the timestamp at which this operation is occurring
          * @return the number of source records that were generated; will be 0 or more
@@ -157,7 +166,7 @@ public class RecordMakers {
             Document patchObj = oplogEvent.get("o", Document.class);
             // Updates have an 'o2' field, since the updated object in 'o' might not have the ObjectID ...
             Object o2 = oplogEvent.get("o2");
-            String objId = o2 != null ? objectIdLiteral(o2) : objectIdLiteralFrom(patchObj);
+            String objId = o2 != null ? idObjToJson(o2) : idObjToJson(patchObj);
             assert objId != null;
             Operation operation = operationLiterals.get(oplogEvent.getString("op"));
             return createRecords(sourceValue, offset, operation, objId, patchObj, timestamp);
@@ -192,7 +201,7 @@ public class RecordMakers {
             SourceRecord record = new SourceRecord(sourcePartition, offset, topicName, partition, keySchema, key, valueSchema, value);
             recorder.accept(record);
 
-            if (operation == Operation.DELETE) {
+            if (operation == Operation.DELETE && emitTombstonesOnDelete) {
                 // Also generate a tombstone event ...
                 record = new SourceRecord(sourcePartition, offset, topicName, partition, keySchema, key, null, null);
                 recorder.accept(record);
@@ -201,37 +210,20 @@ public class RecordMakers {
             return 1;
         }
 
-        protected String objectIdLiteralFrom(Document obj) {
-            if (obj == null) {
+        protected String idObjToJson(Object idObj) {
+            if (idObj == null) {
                 return null;
             }
-            Object id = obj.get("_id");
-            return objectIdLiteral(id);
-        }
-
-        protected String objectIdLiteral(Object id) {
-            if (id == null) {
-                return null;
+            if (!(idObj instanceof Document)) {
+                return jsonSerializer.serialize(idObj);
             }
-            if (id instanceof ObjectId) {
-                return ((ObjectId) id).toHexString();
-            }
-            if (id instanceof String) {
-                return (String) id;
-            }
-            if (id instanceof Document) {
-                Document doc = (Document)id;
-                if (doc.containsKey("_id") && doc.size() == 1) {
-                    // This is an embedded ObjectId ...
-                    return objectIdLiteral(doc.get("_id"));
-                }
-                return valueTransformer.apply((Document) id);
-            }
-            return id.toString();
+            return jsonSerializer.serialize(
+                    ((Document)idObj).get(DBCollection.ID_FIELD_NAME)
+            );
         }
 
         protected Struct keyFor(String objId) {
-            return new Struct(keySchema).put("_id", objId);
+            return new Struct(keySchema).put("id", objId);
         }
     }
 

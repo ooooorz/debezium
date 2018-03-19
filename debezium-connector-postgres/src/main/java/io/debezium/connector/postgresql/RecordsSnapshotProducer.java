@@ -6,18 +6,19 @@
 
 package io.debezium.connector.postgresql;
 
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.sql.Types;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -32,11 +33,14 @@ import io.debezium.annotation.ThreadSafe;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.data.Envelope;
+import io.debezium.data.SpecialValueDecimal;
+import io.debezium.function.BlockingConsumer;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
 import io.debezium.util.LoggingContext;
 import io.debezium.util.Strings;
+import io.debezium.util.Threads;
 
 /**
  * Producer of {@link org.apache.kafka.connect.source.SourceRecord source records} from a database snapshot. Once completed,
@@ -58,7 +62,7 @@ public class RecordsSnapshotProducer extends RecordsProducer {
                                    SourceInfo sourceInfo,
                                    boolean continueStreamingAfterCompletion) {
         super(taskContext, sourceInfo);
-        executorService = Executors.newSingleThreadExecutor(runnable -> new Thread(runnable, CONTEXT_NAME + "-thread"));
+        executorService = Threads.newSingleThreadExecutor(PostgresConnector.class, taskContext.config().serverName(), CONTEXT_NAME);
         currentRecord = new AtomicReference<>();
         if (continueStreamingAfterCompletion) {
             // we need to create the stream producer here to make sure it creates the replication connection;
@@ -70,32 +74,31 @@ public class RecordsSnapshotProducer extends RecordsProducer {
     }
 
     @Override
-    protected void start(Consumer<SourceRecord> recordConsumer) {
+    protected void start(BlockingConsumer<ChangeEvent> eventConsumer, Consumer<Throwable> failureConsumer) {
         // MDC should be in inherited from parent to child threads
         LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
         try {
-            CompletableFuture.runAsync(() -> this.takeSnapshot(recordConsumer), executorService)
-                             .thenRun(() -> this.startStreaming(recordConsumer))
-                             .exceptionally(this::handleException);
+            CompletableFuture.runAsync(() -> this.takeSnapshot(eventConsumer), executorService)
+                             .thenRun(() -> this.startStreaming(eventConsumer, failureConsumer))
+                             .exceptionally(e -> {
+                                 logger.error("unexpected exception", e.getCause() != null ? e.getCause() : e);
+                                 // always stop to clean up data
+                                 stop();
+                                 failureConsumer.accept(e);
+
+                                 return null;
+                             });
         } finally {
             previousContext.restore();
         }
     }
 
-    private Void handleException(Throwable t) {
-        logger.error("unexpected exception", t.getCause() != null ? t.getCause() : t);
-        // always stop to clean up data
-        stop();
-        taskContext.failTask(t);
-        return null;
-    }
-
-    private void startStreaming(Consumer<SourceRecord> consumer) {
+    private void startStreaming(BlockingConsumer<ChangeEvent> consumer, Consumer<Throwable> failureConsumer) {
         try {
             // and then start streaming if necessary
             streamProducer.ifPresent(producer -> {
                 logger.info("Snapshot finished, continuing streaming changes from {}", ReplicationConnection.format(sourceInfo.lsn()));
-                producer.start(consumer);
+                producer.start(consumer, failureConsumer);
 
             });
         } finally {
@@ -105,8 +108,8 @@ public class RecordsSnapshotProducer extends RecordsProducer {
     }
 
     @Override
-    protected void commit()  {
-        streamProducer.ifPresent(RecordsStreamProducer::commit);
+    protected void commit(long lsn)  {
+        streamProducer.ifPresent(x -> x.commit(lsn));
     }
 
     @Override
@@ -123,7 +126,7 @@ public class RecordsSnapshotProducer extends RecordsProducer {
         executorService.shutdownNow();
     }
 
-    private void takeSnapshot(Consumer<SourceRecord> consumer) {
+    private void takeSnapshot(BlockingConsumer<ChangeEvent> consumer) {
         long snapshotStart = clock().currentTimeInMillis();
         Connection jdbcConnection = null;
         try (PostgresConnection connection = taskContext.createConnection()) {
@@ -173,54 +176,74 @@ public class RecordsSnapshotProducer extends RecordsProducer {
 
             logger.info("Step 3: reading and exporting the contents of each table");
             AtomicInteger rowsCounter = new AtomicInteger(0);
-            schema.tables().forEach(tableId -> {
+            final Map<TableId, String> selectOverrides = getSnapshotSelectOverridesByTable();
+
+            for(TableId tableId : schema.tables()) {
                 if (schema.isFilteredOut(tableId)) {
                     logger.info("\t table '{}' is filtered out, ignoring", tableId);
-                    return;
+                    continue;
                 }
+
                 long exportStart = clock().currentTimeInMillis();
                 logger.info("\t exporting data from table '{}'", tableId);
                 try {
                     // DBZ-298 Quoting name in case it has been quoted originally; it doesn't do harm if it hasn't been quoted
-                    connection.query("SELECT * FROM " + tableId.toDoubleQuotedString(),
-                                     this::readTableStatement,
-                                     rs -> readTable(tableId, rs, consumer, rowsCounter));
+                    final String selectStatement = selectOverrides.getOrDefault(tableId, "SELECT * FROM " + tableId.toDoubleQuotedString());
+                    logger.info("For table '{}' using select statement: '{}'", tableId, selectStatement);
+
+                    connection.queryWithBlockingConsumer(selectStatement,
+                            this::readTableStatement,
+                            rs -> readTable(tableId, rs, consumer, rowsCounter));
                     logger.info("\t finished exporting '{}' records for '{}'; total duration '{}'", rowsCounter.get(),
-                                tableId, Strings.duration(clock().currentTimeInMillis() - exportStart));
+                            tableId, Strings.duration(clock().currentTimeInMillis() - exportStart));
                     rowsCounter.set(0);
                 } catch (SQLException e) {
                     throw new ConnectException(e);
                 }
-            });
+            }
 
             // finally commit the transaction to release all the locks...
             logger.info("Step 4: committing transaction '{}'", txId);
             jdbcConnection.commit();
 
-            // process and send the last record after marking it as such
-            logger.info("Step 5: sending the last snapshot record");
             SourceRecord currentRecord = this.currentRecord.get();
             if (currentRecord != null) {
+                // process and send the last record after marking it as such
+                logger.info("Step 5: sending the last snapshot record");
                 sourceInfo.markLastSnapshotRecord();
                 this.currentRecord.set(new SourceRecord(currentRecord.sourcePartition(), sourceInfo.offset(),
                                                         currentRecord.topic(), currentRecord.kafkaPartition(),
                                                         currentRecord.keySchema(), currentRecord.key(),
                                                         currentRecord.valueSchema(), currentRecord.value()));
+
                 sendCurrentRecord(consumer);
             }
 
             // and complete the snapshot
             sourceInfo.completeSnapshot();
             logger.info("Snapshot completed in '{}'", Strings.duration(clock().currentTimeInMillis() - snapshotStart));
-        } catch (SQLException e) {
-            try {
-                if (jdbcConnection != null) {
-                    jdbcConnection.rollback();
-                }
-            } catch (SQLException se) {
-                logger.error("Cannot rollback snapshot transaction", se);
-            }
+        }
+        catch (SQLException e) {
+            rollbackTransaction(jdbcConnection);
+
             throw new ConnectException(e);
+        }
+        catch(InterruptedException e)  {
+            Thread.interrupted();
+            rollbackTransaction(jdbcConnection);
+
+            logger.warn("Snapshot aborted after '{}'", Strings.duration(clock().currentTimeInMillis() - snapshotStart));
+        }
+    }
+
+    private void rollbackTransaction(Connection jdbcConnection) {
+        try {
+            if (jdbcConnection != null) {
+                jdbcConnection.rollback();
+            }
+        }
+        catch (SQLException se) {
+            logger.error("Cannot rollback snapshot transaction", se);
         }
     }
 
@@ -232,8 +255,8 @@ public class RecordsSnapshotProducer extends RecordsProducer {
     }
 
     private void readTable(TableId tableId, ResultSet rs,
-                           Consumer<SourceRecord> consumer,
-                           AtomicInteger rowsCounter) throws SQLException {
+                           BlockingConsumer<ChangeEvent> consumer,
+                           AtomicInteger rowsCounter) throws SQLException, InterruptedException {
         Table table = schema().tableFor(tableId);
         assert table != null;
         final int numColumns = table.columns().size();
@@ -251,24 +274,39 @@ public class RecordsSnapshotProducer extends RecordsProducer {
 
     private Object valueForColumn(ResultSet rs, int colIdx, ResultSetMetaData metaData) throws SQLException {
         try {
-            int jdbcSqlType = metaData.getColumnType(colIdx);
-            if ( jdbcSqlType == Types.ARRAY) {
-                Object array = rs.getArray(colIdx).getArray();
-                if ( array == null ) return false;
-                return Arrays.asList((Object[])array);
+            final String columnTypeName = metaData.getColumnTypeName(colIdx);
+            final PostgresType type = taskContext.schema().getTypeRegistry().get(columnTypeName);
+
+            if (type.isArrayType()) {
+                Array array = rs.getArray(colIdx);
+
+                if (array == null) {
+                    return null;
+                }
+
+                return Arrays.asList((Object[])array.getArray());
             }
-            String columnTypeName = metaData.getColumnTypeName(colIdx);
-            int colOid = PgOid.valueOf(columnTypeName);
-            switch (colOid) {
+
+            switch (type.getOid()) {
                 case PgOid.MONEY:
                     //TODO author=Horia Chiorean date=14/11/2016 description=workaround for https://github.com/pgjdbc/pgjdbc/issues/100
                     return new PGmoney(rs.getString(colIdx)).val;
                 case PgOid.BIT:
                     return rs.getString(colIdx);
+                case PgOid.NUMERIC:
+                    final String s = rs.getString(colIdx);
+                    if (s == null) {
+                        return s;
+                    }
+
+                    Optional<SpecialValueDecimal> value = PostgresValueConverter.toSpecialValue(s);
+                    return value.isPresent() ? value.get() : new SpecialValueDecimal(rs.getBigDecimal(colIdx));
+
                 default:
                     return rs.getObject(colIdx);
             }
-        } catch (SQLException e) {
+        }
+        catch (SQLException e) {
             // not a known type
             return rs.getObject(colIdx);
         }
@@ -290,12 +328,12 @@ public class RecordsSnapshotProducer extends RecordsProducer {
         Map<String, ?> partition = sourceInfo.partition();
         Map<String, ?> offset = sourceInfo.offset();
         String topicName = topicSelector().topicNameFor(tableId);
-        Envelope envelope = createEnvelope(tableSchema, topicName);
+        Envelope envelope = tableSchema.getEnvelopeSchema();
         currentRecord.set(new SourceRecord(partition, offset, topicName, null, keySchema, key, envelope.schema(),
                                            envelope.read(value, sourceInfo.source(), clock().currentTimeInMillis())));
     }
 
-    private void sendCurrentRecord(Consumer<SourceRecord> consumer) {
+    private void sendCurrentRecord(BlockingConsumer<ChangeEvent> consumer) throws InterruptedException {
         SourceRecord record = currentRecord.get();
         if (record == null) {
             return;
@@ -304,6 +342,28 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             logger.debug("sending read event '{}'", record);
         }
         //send the last generated record
-        consumer.accept(record);
+        consumer.accept(new ChangeEvent(record));
+    }
+
+    /**
+     * Returns any SELECT overrides, if present.
+     */
+    private Map<TableId, String> getSnapshotSelectOverridesByTable() {
+        String tableList = taskContext.getConfig().snapshotSelectOverrides();
+
+        if (tableList == null) {
+            return Collections.emptyMap();
+        }
+
+        Map<TableId, String> snapshotSelectOverridesByTable = new HashMap<>();
+
+        for (String table : tableList.split(",")) {
+            snapshotSelectOverridesByTable.put(
+                TableId.parse(table),
+                taskContext.getConfig().snapshotSelectOverrideForTable(table)
+            );
+        }
+
+        return snapshotSelectOverridesByTable;
     }
 }

@@ -5,10 +5,7 @@
  */
 package io.debezium.relational;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
 import java.sql.Types;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,10 +22,11 @@ import org.slf4j.LoggerFactory;
 
 import io.debezium.annotation.Immutable;
 import io.debezium.annotation.ThreadSafe;
+import io.debezium.data.Envelope;
 import io.debezium.data.SchemaUtil;
-import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.mapping.ColumnMapper;
 import io.debezium.relational.mapping.ColumnMappers;
+import io.debezium.util.SchemaNameAdjuster;
 
 /**
  * Builder that constructs {@link TableSchema} instances for {@link Table} definitions.
@@ -49,47 +47,21 @@ public class TableSchemaBuilder {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(TableSchemaBuilder.class);
 
-    private final Function<String, String> schemaNameValidator;
+    private final SchemaNameAdjuster schemaNameAdjuster;
     private final ValueConverterProvider valueConverterProvider;
+    private final Schema sourceInfoSchema;
 
     /**
      * Create a new instance of the builder.
      *
      * @param valueConverterProvider the provider for obtaining {@link ValueConverter}s and {@link SchemaBuilder}s; may not be
      *            null
-     * @param schemaNameValidator the validation function for schema names; may not be null
+     * @param schemaNameAdjuster the adjuster for schema names; may not be null
      */
-    public TableSchemaBuilder(ValueConverterProvider valueConverterProvider, Function<String, String> schemaNameValidator) {
-        this.schemaNameValidator = schemaNameValidator;
+    public TableSchemaBuilder(ValueConverterProvider valueConverterProvider, SchemaNameAdjuster schemaNameAdjuster, Schema sourceInfoSchema) {
+        this.schemaNameAdjuster = schemaNameAdjuster;
         this.valueConverterProvider = valueConverterProvider;
-    }
-
-    /**
-     * Create a {@link TableSchema} from the given JDBC {@link ResultSet}. The resulting TableSchema will have no primary key,
-     * and its {@link TableSchema#valueSchema()} will contain fields for each column in the result set.
-     *
-     * @param resultSet the result set for a query; may not be null
-     * @param name the name of the value schema; may not be null
-     * @return the table schema that can be used for sending rows of data for this table to Kafka Connect; never null
-     * @throws SQLException if an error occurs while using the result set's metadata
-     */
-    public TableSchema create(ResultSet resultSet, String name) throws SQLException {
-        // Determine the columns that make up the result set ...
-        List<Column> columns = new ArrayList<>();
-        JdbcConnection.columnsFor(resultSet, columns::add);
-
-        // Create a schema that represents these columns ...
-        String schemaName = schemaNameValidator.apply(name);
-        SchemaBuilder schemaBuilder = SchemaBuilder.struct().name(schemaName);
-        columns.forEach(column -> addField(schemaBuilder, column, null));
-        Schema valueSchema = schemaBuilder.build();
-
-        // And a generator that can be used to create values from rows in the result set ...
-        TableId id = new TableId(null, null, name);
-        Function<Object[], Struct> valueGenerator = createValueGenerator(valueSchema, id, columns, null, null);
-
-        // Finally create our result object with no primary key or key generator ...
-        return new TableSchema(null, null, valueSchema, valueGenerator);
+        this.sourceInfoSchema = sourceInfoSchema;
     }
 
     /**
@@ -102,38 +74,22 @@ public class TableSchemaBuilder {
      *
      * @param schemaPrefix the prefix added to the table identifier to construct the schema names; may be null if there is no
      *            prefix
-     * @param table the table definition; may not be null
-     * @return the table schema that can be used for sending rows of data for this table to Kafka Connect; never null
-     */
-    public TableSchema create(String schemaPrefix, Table table) {
-        return create(schemaPrefix, table, null, null);
-    }
-
-    /**
-     * Create a {@link TableSchema} from the given {@link Table table definition}. The resulting TableSchema will have a
-     * {@link TableSchema#keySchema() key schema} that contains all of the columns that make up the table's primary key,
-     * and a {@link TableSchema#valueSchema() value schema} that contains only those columns that are not in the table's primary
-     * key.
-     * <p>
-     * This is equivalent to calling {@code create(table,false)}.
-     *
-     * @param schemaPrefix the prefix added to the table identifier to construct the schema names; may be null if there is no
-     *            prefix
+     * @param envelopSchemaName the name of the schema of the built table's envelope
      * @param table the table definition; may not be null
      * @param filter the filter that specifies whether columns in the table should be included; may be null if all columns
      *            are to be included
      * @param mappers the mapping functions for columns; may be null if none of the columns are to be mapped to different values
      * @return the table schema that can be used for sending rows of data for this table to Kafka Connect; never null
      */
-    public TableSchema create(String schemaPrefix, Table table, Predicate<ColumnId> filter, ColumnMappers mappers) {
+    public TableSchema create(String schemaPrefix, String envelopSchemaName, Table table, Predicate<ColumnId> filter, ColumnMappers mappers) {
         if (schemaPrefix == null) schemaPrefix = "";
         // Build the schemas ...
         final TableId tableId = table.id();
         final String tableIdStr = tableId.toString();
         final String schemaNamePrefix = schemaPrefix + tableIdStr;
         LOGGER.debug("Mapping table '{}' to schemas under '{}'", tableId, schemaNamePrefix);
-        SchemaBuilder valSchemaBuilder = SchemaBuilder.struct().name(schemaNameValidator.apply(schemaNamePrefix + ".Value"));
-        SchemaBuilder keySchemaBuilder = SchemaBuilder.struct().name(schemaNameValidator.apply(schemaNamePrefix + ".Key"));
+        SchemaBuilder valSchemaBuilder = SchemaBuilder.struct().name(schemaNameAdjuster.adjust(schemaNamePrefix + ".Value"));
+        SchemaBuilder keySchemaBuilder = SchemaBuilder.struct().name(schemaNameAdjuster.adjust(schemaNamePrefix + ".Key"));
         AtomicBoolean hasPrimaryKey = new AtomicBoolean(false);
         table.columns().forEach(column -> {
             if (table.isPrimaryKeyColumn(column.name())) {
@@ -155,12 +111,19 @@ public class TableSchemaBuilder {
             LOGGER.debug("Mapped columns for table '{}' to schema: {}", tableId, SchemaUtil.asDetailedString(valSchema));
         }
 
+        Envelope envelope = Envelope.defineSchema()
+                .withName(schemaNameAdjuster.adjust(envelopSchemaName))
+                .withRecord(valSchema)
+                .withSource(sourceInfoSchema)
+                .build();
+
+
         // Create the generators ...
         Function<Object[], Object> keyGenerator = createKeyGenerator(keySchema, tableId, table.primaryKeyColumns());
         Function<Object[], Struct> valueGenerator = createValueGenerator(valSchema, tableId, table.columns(), filter, mappers);
 
         // And the table schema ...
-        return new TableSchema(keySchema, keyGenerator, valSchema, valueGenerator);
+        return new TableSchema(keySchema, keyGenerator, envelope, valSchema, valueGenerator);
     }
 
     /**
@@ -219,7 +182,6 @@ public class TableSchemaBuilder {
             Field[] fields = fieldsForColumns(schema, columns);
             int numFields = recordIndexes.length;
             ValueConverter[] converters = convertersForColumns(schema, tableId, columns, filter, mappers);
-            AtomicBoolean traceMessage = new AtomicBoolean(true);
             return (row) -> {
                 Struct result = new Struct(schema);
                 for (int i = 0; i != numFields; ++i) {
@@ -233,10 +195,11 @@ public class TableSchemaBuilder {
                             Column col = columns.get(i);
                             LOGGER.error("Failed to properly convert data value for '{}.{}' of type {} for row {}:",
                                          tableId, col.name(), col.typeName(), row, e);
+                        } catch (final Exception e) {
+                            Column col = columns.get(i);
+                            LOGGER.error("Failed to properly convert data value for '{}.{}' of type {} for row {}:",
+                                         tableId, col.name(), col.typeName(), row, e);
                         }
-                    } else if (traceMessage.getAndSet(false)) {
-                        Column col = columns.get(i);
-                        LOGGER.trace("Excluding '{}.{}' of type {}", tableId, col.name(), col.typeName());
                     }
                 }
                 return result;
@@ -278,29 +241,49 @@ public class TableSchemaBuilder {
      */
     protected ValueConverter[] convertersForColumns(Schema schema, TableId tableId, List<Column> columns,
                                                     Predicate<ColumnId> filter, ColumnMappers mappers) {
+
         ValueConverter[] converters = new ValueConverter[columns.size()];
-        AtomicInteger i = new AtomicInteger(0);
-        columns.forEach(column -> {
-            Field field = schema.field(column.name());
-            ValueConverter converter = null;
-            if (filter == null || filter.test(new ColumnId(tableId, column.name()))) {
-                ValueConverter valueConverter = createValueConverterFor(column, field);
-                assert valueConverter != null;
-                if (mappers != null) {
-                    ValueConverter mappingConverter = mappers.mappingConverterFor(tableId, column);
-                    if (mappingConverter != null) {
-                        converter = (value) -> {
-                            if (value != null) value = valueConverter.convert(value);
-                            return mappingConverter.convert(value);
-                        };
-                    }
-                }
-                if (converter == null) converter = valueConverter;
-                assert converter != null;
+
+        for (int i = 0; i < columns.size(); i++) {
+            Column column = columns.get(i);
+
+            if (filter != null && !filter.test(new ColumnId(tableId, column.name()))) {
+                continue;
             }
-            converters[i.getAndIncrement()] = converter; // may be null if not included
-        });
+
+            ValueConverter converter = createValueConverterFor(column, schema.field(column.name()));
+            converter = wrapInMappingConverterIfNeeded(mappers, tableId, column, converter);
+
+            if (converter == null) {
+                LOGGER.warn(
+                        "No converter found for column {}.{} of type {}. The column will not be part of change events for that table.",
+                        tableId, column.name(), column.typeName());
+            }
+
+            // may be null if no converter found
+            converters[i] = converter;
+        }
+
         return converters;
+    }
+
+    private ValueConverter wrapInMappingConverterIfNeeded(ColumnMappers mappers, TableId tableId, Column column, ValueConverter converter) {
+        if (mappers == null || converter == null) {
+            return converter;
+        }
+
+        ValueConverter mappingConverter = mappers.mappingConverterFor(tableId, column);
+        if (mappingConverter == null) {
+            return converter;
+        }
+
+        return (value) -> {
+            if (value != null) {
+                value = converter.convert(value);
+            }
+
+            return mappingConverter.convert(value);
+        };
     }
 
     /**

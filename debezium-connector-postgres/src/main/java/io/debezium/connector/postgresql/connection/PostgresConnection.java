@@ -11,16 +11,21 @@ import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.postgresql.jdbc.PgConnection;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.postgresql.core.BaseConnection;
+import org.postgresql.core.TypeInfo;
 import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.util.PSQLState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.PostgresType;
+import io.debezium.connector.postgresql.TypeRegistry;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.TableId;
@@ -39,6 +44,15 @@ public class PostgresConnection extends JdbcConnection {
                                                                                     PostgresConnection.class.getClassLoader());
     private static Logger LOGGER = LoggerFactory.getLogger(PostgresConnection.class);
 
+    private static final String SQL_NON_ARRAY_TYPES = "SELECT t.oid AS oid, t.typname AS name "
+            + "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON (t.typnamespace = n.oid) "
+            + "WHERE n.nspname != 'pg_toast' AND t.typcategory <> 'A'";
+    private static final String SQL_ARRAY_TYPES = "SELECT t.oid AS oid, t.typname AS name, t.typelem AS element "
+            + "FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON (t.typnamespace = n.oid) "
+            + "WHERE n.nspname != 'pg_toast' AND t.typcategory = 'A'";
+
+    private final TypeRegistry typeRegistry;
+
     /**
      * Creates a Postgres connection using the supplied configuration.
      *
@@ -46,6 +60,13 @@ public class PostgresConnection extends JdbcConnection {
      */
     public PostgresConnection(Configuration config) {
         super(config, FACTORY, PostgresConnection::validateServerVersion, PostgresConnection::defaultSettings);
+
+        try {
+            typeRegistry = initTypeRegistry(connection(), readTypeInfo());
+        }
+        catch (SQLException e) {
+            throw new ConnectException("Could not intialize type registry", e);
+        }
     }
 
     /**
@@ -105,29 +126,57 @@ public class PostgresConnection extends JdbcConnection {
         AtomicReference<ServerInfo.ReplicationSlot> replicationSlotInfo = new AtomicReference<>();
         String database = database();
         prepareQuery(
-                     "select * from pg_replication_slots where slot_name = ? and database = ? and plugin = ?", statement -> {
-                         statement.setString(1, slotName);
-                         statement.setString(2, database);
-                         statement.setString(3, pluginName);
-                     }, rs -> {
-                         if (rs.next()) {
-                             boolean active = rs.getBoolean("active");
-                             Long confirmedFlushedLSN = null;
-                             try {
-                                 String confirmedFlushLSNString = rs.getString("confirmed_flush_lsn");
-                                 confirmedFlushedLSN = LogSequenceNumber.valueOf(confirmedFlushLSNString).asLong();
-                             } catch (SQLException e) {
-                                 // info not available, so we must be prior to PG 9.6
-                             }
-                             replicationSlotInfo.compareAndSet(null, new ServerInfo.ReplicationSlot(active, confirmedFlushedLSN));
-                         } else {
-                             LOGGER.debug("No replication slot '{}' is present for plugin '{}' and database '{}'", slotName,
-                                          pluginName, database);
-                             replicationSlotInfo.compareAndSet(null, ServerInfo.ReplicationSlot.INVALID);
-                         }
-                     });
+             "select * from pg_replication_slots where slot_name = ? and database = ? and plugin = ?", statement -> {
+                 statement.setString(1, slotName);
+                 statement.setString(2, database);
+                 statement.setString(3, pluginName);
+             },
+             rs -> {
+                 if (rs.next()) {
+                     boolean active = rs.getBoolean("active");
+                     Long confirmedFlushedLSN = parseConfirmedFlushLsn(slotName, pluginName, database, rs);
+                     replicationSlotInfo.compareAndSet(null, new ServerInfo.ReplicationSlot(active, confirmedFlushedLSN));
+                 }
+                 else {
+                     LOGGER.debug("No replication slot '{}' is present for plugin '{}' and database '{}'", slotName,
+                                  pluginName, database);
+                     replicationSlotInfo.compareAndSet(null, ServerInfo.ReplicationSlot.INVALID);
+                 }
+             }
+        );
 
         return replicationSlotInfo.get();
+    }
+
+    private Long parseConfirmedFlushLsn(String slotName, String pluginName, String database, ResultSet rs) {
+        Long confirmedFlushedLsn = null;
+
+        try {
+            String confirmedFlushLSNString = rs.getString("confirmed_flush_lsn");
+            if (confirmedFlushLSNString == null) {
+                throw new ConnectException("Value confirmed_flush_lsn is missing from the pg_replication_slots table for slot = '"
+                        + slotName + "', plugin = '"
+                        + pluginName + "', database = '"
+                        + database + "'. This is an abnormal situation and the database status should be checked.");
+            }
+            try {
+                confirmedFlushedLsn = LogSequenceNumber.valueOf(confirmedFlushLSNString).asLong();
+            }
+            catch (Exception e) {
+                throw new ConnectException("Value confirmed_flush_lsn in the pg_replication_slots table for slot = '"
+                        + slotName + "', plugin = '"
+                        + pluginName + "', database = '"
+                        + database + "' is not valid. This is an abnormal situation and the database status should be checked.");
+            }
+            if (confirmedFlushedLsn == LogSequenceNumber.INVALID_LSN.asLong()) {
+                throw new ConnectException("Invalid LSN returned from database");
+            }
+         }
+        catch (SQLException e) {
+            // info not available, so we must be prior to PG 9.6
+        }
+
+        return confirmedFlushedLsn;
     }
 
     /**
@@ -190,7 +239,8 @@ public class PostgresConnection extends JdbcConnection {
      */
     public long currentXLogLocation() throws SQLException {
         AtomicLong result = new AtomicLong(0);
-        query("select * from pg_current_xlog_location()", rs -> {
+        int majorVersion = connection().getMetaData().getDatabaseMajorVersion();
+        query(majorVersion >= 10 ? "select * from pg_current_wal_lsn()" : "select * from pg_current_xlog_location()", rs -> {
             if (!rs.next()) {
                 throw new IllegalStateException("there should always be a valid xlog position");
             }
@@ -244,21 +294,51 @@ public class PostgresConnection extends JdbcConnection {
     }
 
     @Override
-    protected int resolveComponentType(ResultSet rs) {
+    protected int resolveNativeType(String typeName) {
+        return getTypeRegistry().get(typeName).getOid();
+    }
+
+    private static TypeRegistry initTypeRegistry(Connection db, Map<String, Integer> nameToJdbc) {
+        final TypeInfo typeInfo = ((BaseConnection)db).getTypeInfo();
+        TypeRegistry.Builder typeRegistryBuilder = TypeRegistry.create(typeInfo);
         try {
-            String typeName = rs.getString(6);
-            if (typeName.charAt(0) == '_') {
-                PgConnection connection = (PgConnection)connection();
-                return connection.getTypeInfo().getPGType(typeName);
+            try (final Statement statement = db.createStatement()) {
+                // Read non-array types
+                try (final ResultSet rs = statement.executeQuery(SQL_NON_ARRAY_TYPES)) {
+                    while (rs.next()) {
+                        final int oid = rs.getInt("oid");
+                        typeRegistryBuilder.addType(new PostgresType(
+                                rs.getString("name"),
+                                oid,
+                                nameToJdbc.get(rs.getString("name")),
+                                typeInfo
+                        ));
+                    }
+                }
+
+                // Read array types
+                try (final ResultSet rs = statement.executeQuery(SQL_ARRAY_TYPES)) {
+                    while (rs.next()) {
+                        // int2vector and oidvector will not be treated as arrays
+                        final int oid = rs.getInt("oid");
+                        typeRegistryBuilder.addType(new PostgresType(
+                                rs.getString("name"),
+                                oid,
+                                nameToJdbc.get(rs.getString("name")),
+                                typeInfo,
+                                typeRegistryBuilder.get(rs.getInt("element"))
+                        ));
+                    }
+                }
             }
-            else {
-                LOGGER.warn("resolveComponentType was expecting typeName to start with '_' character: '{}'", typeName);
-            }
-            return -1;
         }
         catch (SQLException e) {
-            LOGGER.warn("Unexpected error trying to get underlying JDBC type for an array:", e);
-            return super.resolveComponentType(rs);
+            throw new ConnectException("Could not intialize type registry", e);
         }
+        return typeRegistryBuilder.build();
+    }
+
+    public TypeRegistry getTypeRegistry() {
+        return typeRegistry;
     }
 }

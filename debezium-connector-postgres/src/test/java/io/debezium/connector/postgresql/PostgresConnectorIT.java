@@ -40,11 +40,13 @@ import org.postgresql.util.PSQLState;
 import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
+import io.debezium.connector.postgresql.PostgresConnectorConfig.LogicalDecoder;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.data.Envelope;
 import io.debezium.data.VerifyRecord;
 import io.debezium.embedded.AbstractConnectorTest;
 import io.debezium.embedded.EmbeddedEngine;
+import io.debezium.jdbc.TemporalPrecisionMode;
 import io.debezium.util.Strings;
 
 /**
@@ -122,7 +124,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertConfigurationErrors(validatedConfig, PostgresConnectorConfig.DATABASE_NAME, 1);
 
         // validate the non required fields
-        validateField(validatedConfig, PostgresConnectorConfig.PLUGIN_NAME, ReplicationConnection.Builder.DEFAULT_PLUGIN_NAME);
+        validateField(validatedConfig, PostgresConnectorConfig.PLUGIN_NAME, LogicalDecoder.DECODERBUFS.getValue());
         validateField(validatedConfig, PostgresConnectorConfig.SLOT_NAME, ReplicationConnection.Builder.DEFAULT_SLOT_NAME);
         validateField(validatedConfig, PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
         validateField(validatedConfig, PostgresConnectorConfig.PORT, PostgresConnectorConfig.DEFAULT_PORT);
@@ -144,7 +146,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         validateField(validatedConfig, PostgresConnectorConfig.COLUMN_BLACKLIST, null);
         validateField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_MODE, INITIAL);
         validateField(validatedConfig, PostgresConnectorConfig.SNAPSHOT_LOCK_TIMEOUT_MS, PostgresConnectorConfig.DEFAULT_SNAPSHOT_LOCK_TIMEOUT_MILLIS);
-        validateField(validatedConfig, PostgresConnectorConfig.TIME_PRECISION_MODE, PostgresConnectorConfig.TemporalPrecisionMode.ADAPTIVE);
+        validateField(validatedConfig, PostgresConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ADAPTIVE);
         validateField(validatedConfig, PostgresConnectorConfig.DECIMAL_HANDLING_MODE, PostgresConnectorConfig.DecimalHandlingMode.PRECISE);
         validateField(validatedConfig, PostgresConnectorConfig.SSL_SOCKET_FACTORY, null);
         validateField(validatedConfig, PostgresConnectorConfig.TCP_KEEPALIVE, null);
@@ -157,14 +159,22 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         Configuration config = TestHelper.defaultConfig().with(PostgresConnectorConfig.SSL_MODE,
                                                                PostgresConnectorConfig.SecureConnectionMode.REQUIRED).build();
         start(PostgresConnector.class, config, (success, msg, error) -> {
-            // we expect the task to fail at startup when we're printing the server info
-            assertThat(success).isFalse();
-            assertThat(error).isInstanceOf(ConnectException.class);
-            Throwable cause = error.getCause();
-            assertThat(cause).isInstanceOf(SQLException.class);
-            assertThat(PSQLState.CONNECTION_REJECTED).isEqualTo(new PSQLState(((SQLException)cause).getSQLState()));
+            if (TestHelper.shouldSSLConnectionFail()) {
+                // we expect the task to fail at startup when we're printing the server info
+                assertThat(success).isFalse();
+                assertThat(error).isInstanceOf(ConnectException.class);
+                Throwable cause = error.getCause();
+                assertThat(cause).isInstanceOf(SQLException.class);
+                assertThat(PSQLState.CONNECTION_REJECTED).isEqualTo(new PSQLState(((SQLException)cause).getSQLState()));
+            }
         });
-        assertConnectorNotRunning();
+        if (TestHelper.shouldSSLConnectionFail()) {
+            assertConnectorNotRunning();
+        } else {
+            assertConnectorIsRunning();
+            Thread.sleep(10000);
+            stopConnector();
+        }
     }
 
     @Test
@@ -281,7 +291,6 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
 
         //check the records from the snapshot
         assertRecordsFromSnapshot(2, 1, 1);
-
         // insert and verify 2 new records
         TestHelper.execute(INSERT_STMT);
         assertRecordsAfterInsert(2, 2, 2);

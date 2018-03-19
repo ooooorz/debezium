@@ -87,8 +87,11 @@ public class MySqlDdlParser extends DdlParser {
         dataTypes.register(Types.BIGINT, "BIGINT[(L)] [UNSIGNED|SIGNED] [ZEROFILL]");
         dataTypes.register(Types.REAL, "REAL[(M[,D])] [UNSIGNED] [ZEROFILL]");
         dataTypes.register(Types.DOUBLE, "DOUBLE[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
+        dataTypes.register(Types.DOUBLE, "DOUBLE PRECISION[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
         dataTypes.register(Types.FLOAT, "FLOAT[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
         dataTypes.register(Types.DECIMAL, "DECIMAL[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
+        dataTypes.register(Types.DECIMAL, "FIXED[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
+        dataTypes.register(Types.DECIMAL, "DEC[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
         dataTypes.register(Types.NUMERIC, "NUMERIC[(M[,D])] [UNSIGNED|SIGNED] [ZEROFILL]");
         dataTypes.register(Types.BOOLEAN, "BOOLEAN");
         dataTypes.register(Types.BOOLEAN, "BOOL");
@@ -119,13 +122,20 @@ public class MySqlDdlParser extends DdlParser {
         dataTypes.register(Types.BLOB, "MEDIUMTEXT BINARY");
         dataTypes.register(Types.BLOB, "LONGTEXT BINARY");
         dataTypes.register(Types.VARCHAR, "TINYTEXT");
-        dataTypes.register(Types.VARCHAR, "TEXT");
+        dataTypes.register(Types.VARCHAR, "TEXT[(L)]");
         dataTypes.register(Types.VARCHAR, "MEDIUMTEXT");
         dataTypes.register(Types.VARCHAR, "LONGTEXT");
         dataTypes.register(Types.CHAR, "ENUM(...)");
         dataTypes.register(Types.CHAR, "SET(...)");
         dataTypes.register(Types.OTHER, "JSON");
+        dataTypes.register(Types.OTHER, "GEOMETRY");
         dataTypes.register(Types.OTHER, "POINT");
+        dataTypes.register(Types.OTHER, "LINESTRING");
+        dataTypes.register(Types.OTHER, "POLYGON");
+        dataTypes.register(Types.OTHER, "MULTIPOINT");
+        dataTypes.register(Types.OTHER, "MULTILINESTRING");
+        dataTypes.register(Types.OTHER, "MULTIPOLYGON");
+        dataTypes.register(Types.OTHER, "GEOMETRYCOLLECTION");
     }
 
     @Override
@@ -134,7 +144,7 @@ public class MySqlDdlParser extends DdlParser {
 
     @Override
     protected void initializeStatementStarts(TokenSet statementStartTokens) {
-        statementStartTokens.add("CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "FLUSH", "TRUNCATE", "COMMIT", "USE", "SAVEPOINT",
+        statementStartTokens.add("CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "FLUSH", "TRUNCATE", "COMMIT", "USE", "SAVEPOINT", "ROLLBACK",
                 // table maintenance statements: https://dev.mysql.com/doc/refman/5.7/en/table-maintenance-sql.html
                 "ANALYZE", "OPTIMIZE", "REPAIR",
                 // DML-related statements
@@ -408,7 +418,8 @@ public class MySqlDdlParser extends DdlParser {
             return true;
         } else if (tokens.canConsumeAnyOf("CHECKSUM", "ENGINE", "AVG_ROW_LENGTH", "MAX_ROWS", "MIN_ROWS", "ROW_FORMAT",
                                           "DELAY_KEY_WRITE", "INSERT_METHOD", "KEY_BLOCK_SIZE", "PACK_KEYS",
-                                          "STATS_AUTO_RECALC", "STATS_PERSISTENT", "STATS_SAMPLE_PAGES" , "PAGE_CHECKSUM" )) {
+                                          "STATS_AUTO_RECALC", "STATS_PERSISTENT", "STATS_SAMPLE_PAGES" , "PAGE_CHECKSUM",
+                                          "COMPRESSION")) {
             // One option token followed by '=' by a single value
             tokens.canConsume('=');
             tokens.consume();
@@ -427,7 +438,7 @@ public class MySqlDdlParser extends DdlParser {
             tokens.canConsume('=');
             tokens.consume();
             return true;
-        } else if (tokens.canConsumeAnyOf("COMMENT", "COMPRESSION", "CONNECTION", "ENCRYPTION", "PASSWORD")) {
+        } else if (tokens.canConsumeAnyOf("COMMENT", "CONNECTION", "ENCRYPTION", "PASSWORD")) {
             tokens.canConsume('=');
             consumeQuotedString();
             return true;
@@ -492,6 +503,10 @@ public class MySqlDdlParser extends DdlParser {
         if (tokens.canConsume('(')) {
             do {
                 parsePartitionDefinition(start, table);
+                if(tokens.canConsume("ENGINE")) {
+                        tokens.canConsume('=');
+                        tokens.consume();
+                    }
             } while (tokens.canConsume(','));
             tokens.consume(')');
         }
@@ -554,14 +569,17 @@ public class MySqlDdlParser extends DdlParser {
 
     protected void parseCreateDefinitionList(Marker start, TableEditor table) {
         tokens.consume('(');
-        parseCreateDefinition(start, table);
+        parseCreateDefinition(start, table, false);
         while (tokens.canConsume(',')) {
-            parseCreateDefinition(start, table);
+            parseCreateDefinition(start, table, false);
         }
         tokens.consume(')');
     }
 
-    protected void parseCreateDefinition(Marker start, TableEditor table) {
+    /**
+     * @param isAlterStatement whether this is an ALTER TABLE statement or not (i.e. CREATE TABLE)
+     */
+    protected void parseCreateDefinition(Marker start, TableEditor table, boolean isAlterStatement) {
         // If the first token is a quoted identifier, then we know it is a column name ...
         Collection<ParsingException> errors = null;
         boolean quoted = isNextTokenQuotedIdentifier();
@@ -573,7 +591,10 @@ public class MySqlDdlParser extends DdlParser {
                 consumeExpression(start);
                 return;
             }
-            if (tokens.canConsume("CONSTRAINT", TokenStream.ANY_VALUE, "PRIMARY", "KEY") || tokens.canConsume("PRIMARY", "KEY")) {
+            if (tokens.canConsume("CONSTRAINT", TokenStream.ANY_VALUE, "PRIMARY", "KEY")
+                    || tokens.canConsume("CONSTRAINT", "PRIMARY", "KEY")
+                    || tokens.canConsume("PRIMARY", "KEY")
+            ) {
                 try {
                     if (tokens.canConsume("USING")) {
                         parseIndexType(start);
@@ -602,7 +623,9 @@ public class MySqlDdlParser extends DdlParser {
                     tokens.rewind(defnStart);
                 }
             }
-            if (tokens.canConsume("CONSTRAINT", TokenStream.ANY_VALUE, "UNIQUE") || tokens.canConsume("UNIQUE")) {
+            if (tokens.canConsume("CONSTRAINT", TokenStream.ANY_VALUE, "UNIQUE")
+                    || tokens.canConsume("CONSTRAINT", "UNIQUE")
+                    || tokens.canConsume("UNIQUE")) {
                 tokens.canConsumeAnyOf("KEY", "INDEX");
                 try {
                     if (!tokens.matches('(')) {
@@ -695,7 +718,10 @@ public class MySqlDdlParser extends DdlParser {
 
         try {
             // It's either quoted (meaning it's a column definition)
-            tokens.canConsume("COLUMN"); // optional
+            if (isAlterStatement && !quoted) {
+                tokens.canConsume("COLUMN"); // optional for ALTER TABLE
+            }
+
             String columnName = parseColumnName();
             parseCreateColumn(start, table, columnName, null);
         } catch (ParsingException e) {
@@ -815,6 +841,15 @@ public class MySqlDdlParser extends DdlParser {
             column.charsetName("utf8");
         }
 
+        if (Types.DECIMAL == dataType.jdbcType()) {
+            if (dataType.length() == -1) {
+                column.length(10);
+            }
+            if (dataType.scale() == -1) {
+                column.scale(0);
+            }
+        }
+
         if (tokens.canConsume("CHARSET") || tokens.canConsume("CHARACTER", "SET")) {
             String charsetName = tokens.consume();
             if (!"DEFAULT".equalsIgnoreCase(charsetName)) {
@@ -841,7 +876,7 @@ public class MySqlDdlParser extends DdlParser {
             tokens.canConsume("KEY");
         } else {
             while (tokens.matchesAnyOf("NOT", "NULL", "DEFAULT", "AUTO_INCREMENT", "UNIQUE", "PRIMARY", "KEY", "COMMENT",
-                                       "REFERENCES", "COLUMN_FORMAT", "ON")) {
+                                       "REFERENCES", "COLUMN_FORMAT", "ON", "COLLATE")) {
                 // Nullability ...
                 if (tokens.canConsume("NOT", "NULL")) {
                     column.optional(false);
@@ -883,6 +918,9 @@ public class MySqlDdlParser extends DdlParser {
                 }
                 if (tokens.matches("REFERENCES")) {
                     parseReferenceDefinition(start);
+                }
+                if (tokens.canConsume("COLLATE")) {
+                    tokens.consume(); // name of collation
                 }
             }
         }
@@ -1026,7 +1064,7 @@ public class MySqlDdlParser extends DdlParser {
                 List<String> fromTablePkColumnNames = fromTable.columnNames();
                 List<String> viewPkColumnNames = new ArrayList<>();
                 selectedColumnsByAlias.forEach((viewColumnName, fromTableColumn) -> {
-                    if (fromTablePkColumnNames.contains(fromTableColumn)) {
+                    if (fromTablePkColumnNames.contains(fromTableColumn.name())) {
                         viewPkColumnNames.add(viewColumnName);
                     }
                 });
@@ -1193,7 +1231,7 @@ public class MySqlDdlParser extends DdlParser {
                 parsePartitionDefinition(start, table);
                 tokens.consume(')');
             } else {
-                parseCreateDefinition(start, table);
+                parseCreateDefinition(start, table, true);
             }
         } else if (tokens.canConsume("DROP")) {
             if (tokens.canConsume("PRIMARY", "KEY")) {
@@ -1205,24 +1243,33 @@ public class MySqlDdlParser extends DdlParser {
             } else if (tokens.canConsume("PARTITION")) {
                 parsePartitionNames(start);
             } else {
-                tokens.canConsume("COLUMN");
+                if(!isNextTokenQuotedIdentifier()) {
+                    tokens.canConsume("COLUMN");
+                }
                 String columnName = parseColumnName();
                 table.removeColumn(columnName);
+                tokens.canConsume("RESTRICT");
             }
         } else if (tokens.canConsume("ALTER")) {
-            tokens.canConsume("COLUMN");
+            if (!isNextTokenQuotedIdentifier()) {
+                tokens.canConsume("COLUMN");
+            }
             tokens.consume(); // column name
             if (!tokens.canConsume("DROP", "DEFAULT")) {
-                tokens.consume("SET", "DEFAULT");
+                tokens.consume("SET");
                 parseDefaultClause(start);
             }
         } else if (tokens.canConsume("CHANGE")) {
-            tokens.canConsume("COLUMN");
+            if (!isNextTokenQuotedIdentifier()) {
+                tokens.canConsume("COLUMN");
+            }
             String oldName = parseColumnName();
             String newName = parseColumnName();
             parseCreateColumn(start, table, oldName, newName);
         } else if (tokens.canConsume("MODIFY")) {
-            tokens.canConsume("COLUMN");
+            if (!isNextTokenQuotedIdentifier()) {
+                tokens.canConsume("COLUMN");
+            }
             String columnName = parseColumnName();
             parseCreateColumn(start, table, columnName, null);
         } else if (tokens.canConsumeAnyOf("ALGORITHM", "LOCK")) {
@@ -1273,7 +1320,9 @@ public class MySqlDdlParser extends DdlParser {
         } else if (tokens.canConsume("REORGANIZE", "PARTITION")) {
             parsePartitionNames(start);
             tokens.consume("INTO", "(");
-            parsePartitionDefinition(start, table);
+            do {
+                parsePartitionDefinition(start, table);
+            } while (tokens.canConsume(','));
             tokens.consume(')');
         } else if (tokens.canConsume("EXCHANGE", "PARTITION")) {
             tokens.consume(); // partition name
@@ -1372,7 +1421,7 @@ public class MySqlDdlParser extends DdlParser {
             while (tokens.canConsume(',')) {
                 parseRenameTable(start);
             }
-        } else if (tokens.canConsumeAnyOf("DATABASE", "SCHEMA")) {
+        } else if (tokens.canConsumeAnyOf("DATABASE", "SCHEMA", "USER")) {
             // See https://dev.mysql.com/doc/refman/5.1/en/rename-database.html
             consumeRemainingStatement(start);
         }
@@ -1479,57 +1528,40 @@ public class MySqlDdlParser extends DdlParser {
         LinkedList<String> labels = new LinkedList<>();
         labels.addFirst(getPrecedingBlockLabel());
 
+        int expectedPlainEnds = 0;
+
         // Now look for the "END", ignoring intermediate control blocks that also use "END" ...
-        LinkedList<String> endSuffixes = new LinkedList<>();
         while (tokens.hasNext()) {
-            if (tokens.matches("BEGIN")) {
+            if (tokens.matchesWord("BEGIN")) {
                 consumeBeginStatement(tokens.mark());
             }
-            if (tokens.canConsume("IF", "EXISTS")) {
+            if (tokens.canConsumeWords("IF", "EXISTS")) {
                 // Ignore any IF EXISTS phrases ...
-            }
-            if (tokens.canConsume("IF")) {
-                boolean isControlBlock = true;
-                if (tokens.canConsume("(")) {
-                    // This may be an IF() function or a control block
-                    tokens.consumeThrough(")","(");
-                    if (!tokens.canConsume("THEN")) {
-                        // This was an IF function ...
-                        isControlBlock = false;
-                    }
-                }
-                if (isControlBlock) {
-                    endSuffixes.addFirst("IF"); // block ends with "END IF"
-                    labels.addFirst(null); // labels are not allowed
-                }
-            }
-            if (tokens.canConsume("CASE", "WHEN")) {
-                // This is the beginning of a control block ...
-                endSuffixes.addFirst(null);
-                labels.addFirst(null); // no label for case blocks
-            }
-            if (tokens.canConsume("CASE")) {
-                // This is the beginning of a control block ...
-                endSuffixes.addFirst("CASE");
-                labels.addFirst(null); // no label for case blocks
-            }
-            if (tokens.matchesAnyOf("REPEAT", "LOOP", "WHILE", "CASE")) {
-                // This is the beginning of a control block ...
+            } else if (tokens.canConsumeWords("CASE", "WHEN")) {
+                // This block can end with END without suffix
+                expectedPlainEnds++;
+            } else if (tokens.matchesAnyWordOf("REPEAT", "LOOP", "WHILE")) {
+                // This block can contain label
                 String label = getPrecedingBlockLabel();
-                String keyword = tokens.consume();
-                endSuffixes.addFirst(keyword);
+                tokens.consume();
                 labels.addFirst(label); // may be null
-            }
-            if (tokens.canConsume("END")) {
-                if (endSuffixes.isEmpty()) {
+            } else if (tokens.canConsumeWord("END")) {
+                if (tokens.matchesAnyOf("REPEAT", "LOOP", "WHILE")) {
+                    // Read block label if set
+                    tokens.consume();
+                    String label = labels.remove();
+                    if (label != null) tokens.canConsume(label);
+                } else if (tokens.matchesAnyWordOf("IF", "CASE")) {
+                    tokens.consume();
+                } else if (expectedPlainEnds > 0) {
+                    // There was a statement that will be ended with plain END
+                    expectedPlainEnds--;
+                } else {
                     break;
                 }
-                String suffix = endSuffixes.remove();
-                if (suffix != null) tokens.canConsume(suffix);
-                String label = labels.remove();
-                if (label != null) tokens.canConsume(label);
+            } else {
+                tokens.consume();
             }
-            tokens.consume();
         }
 
         // We've consumed the corresponding END of the BEGIN, but consume the label if one was used ...

@@ -35,23 +35,28 @@ import com.github.shyiko.mysql.binlog.event.RotateEventData;
 import com.github.shyiko.mysql.binlog.event.TableMapEventData;
 import com.github.shyiko.mysql.binlog.event.UpdateRowsEventData;
 import com.github.shyiko.mysql.binlog.event.WriteRowsEventData;
+import com.github.shyiko.mysql.binlog.event.deserialization.EventDataDeserializationException;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.github.shyiko.mysql.binlog.event.deserialization.GtidEventDataDeserializer;
 import com.github.shyiko.mysql.binlog.io.ByteArrayInputStream;
 import com.github.shyiko.mysql.binlog.network.AuthenticationException;
 import com.github.shyiko.mysql.binlog.network.SSLMode;
 
+import io.debezium.connector.mysql.MySqlConnectorConfig.EventProcessingFailureHandlingMode;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SecureConnectionMode;
 import io.debezium.connector.mysql.RecordMakers.RecordsForTable;
 import io.debezium.function.BlockingConsumer;
+import io.debezium.heartbeat.Heartbeat;
+import io.debezium.heartbeat.OffsetPosition;
 import io.debezium.relational.TableId;
 import io.debezium.util.Clock;
 import io.debezium.util.ElapsedTimeStrategy;
 import io.debezium.util.Strings;
+import io.debezium.util.Threads;
 
 /**
  * A component that reads the binlog of a MySQL server, and records any schema changes in {@link MySqlSchema}.
- * 
+ *
  * @author Randall Hauch
  *
  */
@@ -66,9 +71,12 @@ public class BinlogReader extends AbstractReader {
     private final EnumMap<EventType, BlockingConsumer<Event>> eventHandlers = new EnumMap<>(EventType.class);
     private final BinaryLogClient client;
     private final BinlogReaderMetrics metrics;
-    private int startingRowNumber = 0;
     private final Clock clock;
     private final ElapsedTimeStrategy pollOutputDelay;
+    private final EventProcessingFailureHandlingMode eventDeserializationFailureHandlingMode;
+    private final EventProcessingFailureHandlingMode inconsistentSchemaHandlingMode;
+
+    private int startingRowNumber = 0;
     private long recordCounter = 0L;
     private long previousOutputMillis = 0L;
     private long initialEventsToSkip = 0L;
@@ -78,29 +86,89 @@ public class BinlogReader extends AbstractReader {
     private final AtomicLong totalRecordCounter = new AtomicLong();
     private volatile Map<String, ?> lastOffset = null;
     private com.github.shyiko.mysql.binlog.GtidSet gtidSet;
+    private Heartbeat heartbeat;
+    private MySqlJdbcContext connectionContext;
+
+    public static class BinlogPosition {
+        final String filename;
+        final long position;
+
+        public BinlogPosition(String filename, long position) {
+            assert filename != null;
+
+            this.filename = filename;
+            this.position = position;
+        }
+
+        public String getFilename() {
+            return filename;
+        }
+        public long getPosition() {
+            return position;
+        }
+
+        @Override
+        public String toString() {
+            return filename + "/" + position;
+        }
+
+        @Override
+        public int hashCode() {
+            final int prime = 31;
+            int result = 1;
+            result = prime * result + filename.hashCode();
+            result = prime * result + (int) (position ^ (position >>> 32));
+            return result;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj)
+                return true;
+            if (obj == null)
+                return false;
+            if (getClass() != obj.getClass())
+                return false;
+            BinlogPosition other = (BinlogPosition) obj;
+            if (!filename.equals(other.filename))
+                return false;
+            if (position != other.position)
+                return false;
+            return true;
+        }
+    }
 
     /**
      * Create a binlog reader.
-     * 
+     *
      * @param name the name of this reader; may not be null
      * @param context the task context in which this reader is running; may not be null
      */
     public BinlogReader(String name, MySqlTaskContext context) {
         super(name, context);
+
+        connectionContext = context.getConnectionContext();
         source = context.source();
         recordMakers = context.makeRecord();
         recordSchemaChangesInSourceRecords = context.includeSchemaChangeRecords();
-        clock = context.clock();
+        clock = context.getClock();
+        eventDeserializationFailureHandlingMode = connectionContext.eventDeserializationFailureHandlingMode();
+        inconsistentSchemaHandlingMode = connectionContext.inconsistentSchemaHandlingMode();
 
         // Use exponential delay to log the progress frequently at first, but the quickly tapering off to once an hour...
         pollOutputDelay = ElapsedTimeStrategy.exponential(clock, INITIAL_POLL_PERIOD_IN_MILLIS, MAX_POLL_PERIOD_IN_MILLIS);
 
         // Set up the log reader ...
-        client = new BinaryLogClient(context.hostname(), context.port(), context.username(), context.password());
+        client = new BinaryLogClient(connectionContext.hostname(), connectionContext.port(), connectionContext.username(), connectionContext.password());
+        // BinaryLogClient will overwrite thread names later
+        client.setThreadFactory(Threads.threadFactory(MySqlConnector.class, context.serverName(), "binlog-client", false));
         client.setServerId(context.serverId());
-        client.setSSLMode(sslModeFor(context.sslMode()));
+        client.setSSLMode(sslModeFor(connectionContext.sslMode()));
         client.setKeepAlive(context.config().getBoolean(MySqlConnectorConfig.KEEP_ALIVE));
-        client.registerEventListener(this::handleEvent);
+        client.registerEventListener(context.bufferSizeForBinlogReader() == 0
+                ? this::handleEvent
+                : (new EventBuffer(context.bufferSizeForBinlogReader(), this))::add);
+
         client.registerLifecycleListener(new ReaderThreadLifecycleListener());
         if (logger.isDebugEnabled()) client.registerEventListener(this::logEvent);
 
@@ -112,14 +180,33 @@ public class BinlogReader extends AbstractReader {
         EventDeserializer eventDeserializer = new EventDeserializer() {
             @Override
             public Event nextEvent(ByteArrayInputStream inputStream) throws IOException {
-                // Delegate to the superclass ...
-                Event event = super.nextEvent(inputStream);
-                // We have to record the most recent TableMapEventData for each table number for our custom deserializers ...
-                if (event.getHeader().getEventType() == EventType.TABLE_MAP) {
-                    TableMapEventData tableMapEvent = event.getData();
-                    tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
+                try {
+                    // Delegate to the superclass ...
+                    Event event = super.nextEvent(inputStream);
+
+                    // We have to record the most recent TableMapEventData for each table number for our custom deserializers ...
+                    if (event.getHeader().getEventType() == EventType.TABLE_MAP) {
+                        TableMapEventData tableMapEvent = event.getData();
+                        tableMapEventByTableId.put(tableMapEvent.getTableId(), tableMapEvent);
+                    }
+                    return event;
                 }
-                return event;
+                // DBZ-217 In case an event couldn't be read we create a pseudo-event for the sake of logging
+                catch(EventDataDeserializationException edde) {
+                    EventHeaderV4 header = new EventHeaderV4();
+                    header.setEventType(EventType.INCIDENT);
+                    header.setTimestamp(edde.getEventHeader().getTimestamp());
+                    header.setServerId(edde.getEventHeader().getServerId());
+
+                    if(edde.getEventHeader() instanceof EventHeaderV4) {
+                        header.setEventLength(((EventHeaderV4)edde.getEventHeader()).getEventLength());
+                        header.setNextPosition(((EventHeaderV4)edde.getEventHeader()).getNextPosition());
+                        header.setFlags(((EventHeaderV4)edde.getEventHeader()).getFlags());
+                    }
+
+                    EventData data = new EventDataDeserializationExceptionData(edde);
+                    return new Event(header, data);
+                }
             }
         };
         // Add our custom deserializers ...
@@ -144,7 +231,18 @@ public class BinlogReader extends AbstractReader {
 
         // Set up for JMX ...
         metrics = new BinlogReaderMetrics(client);
+        heartbeat = Heartbeat.create(context.config(), context.topicSelector().getHeartbeatTopic(),
+                context.serverName(), () -> OffsetPosition.build(source.partition(), source.offset()));
+    }
+
+    @Override
+    protected void doInitialize() {
         metrics.register(context, logger);
+    }
+
+    @Override
+    public void doDestroy() {
+        metrics.unregister(logger);
     }
 
     @Override
@@ -164,13 +262,14 @@ public class BinlogReader extends AbstractReader {
         eventHandlers.put(EventType.EXT_DELETE_ROWS, this::handleDelete);
         eventHandlers.put(EventType.VIEW_CHANGE, this::viewChange);
         eventHandlers.put(EventType.XA_PREPARE, this::prepareTransaction);
+        eventHandlers.put(EventType.XID, this::handleTransactionCompletion);
 
         // Get the current GtidSet from MySQL so we can get a filtered/merged GtidSet based off of the last Debezium checkpoint.
-        String availableServerGtidStr = context.knownGtidSet();
+        String availableServerGtidStr = connectionContext.knownGtidSet();
         if (availableServerGtidStr != null && !availableServerGtidStr.trim().isEmpty()) {
             // The server is using GTIDs, so enable the handler ...
             eventHandlers.put(EventType.GTID, this::handleGtidEvent);
-            
+
             // Now look at the GTID set from the server and what we've previously seen ...
             GtidSet availableServerGtidSet = new GtidSet(availableServerGtidStr);
             GtidSet filteredGtidSet = context.filterGtidSet(availableServerGtidSet);
@@ -209,7 +308,7 @@ public class BinlogReader extends AbstractReader {
         // Start the log reader, which starts background threads ...
         if (isRunning()) {
             long timeoutInMilliseconds = context.timeoutInMilliseconds();
-            long started = context.clock().currentTimeInMillis();
+            long started = context.getClock().currentTimeInMillis();
             try {
                 logger.debug("Attempting to establish binlog reader connection with timeout of {} ms", timeoutInMilliseconds);
                 client.connect(context.timeoutInMilliseconds());
@@ -217,20 +316,34 @@ public class BinlogReader extends AbstractReader {
                 // If the client thread is interrupted *before* the client could connect, the client throws a timeout exception
                 // The only way we can distinguish this is if we get the timeout exception before the specified timeout has
                 // elapsed, so we simply check this (within 10%) ...
-                long duration = context.clock().currentTimeInMillis() - started;
+                long duration = context.getClock().currentTimeInMillis() - started;
                 if (duration > (0.9 * context.timeoutInMilliseconds())) {
                     double actualSeconds = TimeUnit.MILLISECONDS.toSeconds(duration);
                     throw new ConnectException("Timed out after " + actualSeconds + " seconds while waiting to connect to MySQL at " +
-                            context.hostname() + ":" + context.port() + " with user '" + context.username() + "'", e);
+                            connectionContext.hostname() + ":" + connectionContext.port() + " with user '" + connectionContext.username() + "'", e);
                 }
                 // Otherwise, we were told to shutdown, so we don't care about the timeout exception
             } catch (AuthenticationException e) {
                 throw new ConnectException("Failed to authenticate to the MySQL database at " +
-                        context.hostname() + ":" + context.port() + " with user '" + context.username() + "'", e);
+                        connectionContext.hostname() + ":" + connectionContext.port() + " with user '" + connectionContext.username() + "'", e);
             } catch (Throwable e) {
                 throw new ConnectException("Unable to connect to the MySQL database at " +
-                        context.hostname() + ":" + context.port() + " with user '" + context.username() + "': " + e.getMessage(), e);
+                        connectionContext.hostname() + ":" + connectionContext.port() + " with user '" + connectionContext.username() + "': " + e.getMessage(), e);
             }
+        }
+    }
+
+    protected void rewindBinaryLogClient(BinlogPosition position) {
+        try {
+            if (isRunning()) {
+                logger.debug("Rewinding binlog to position {}", position);
+                client.disconnect();
+                client.setBinlogFilename(position.getFilename());
+                client.setBinlogPosition(position.getPosition());
+                client.connect();
+            }
+        } catch (IOException e) {
+            logger.error("Unexpected error when re-connecting to the MySQL binary log reader", e);
         }
     }
 
@@ -244,10 +357,6 @@ public class BinlogReader extends AbstractReader {
             cleanupResources();
         } catch (IOException e) {
             logger.error("Unexpected error when disconnecting from the MySQL binary log reader", e);
-        } finally {
-            // We unregister our JMX metrics now, which means we won't record metrics for records that
-            // may be processed between now and complete shutdown. That's okay.
-            metrics.unregister(logger);
         }
     }
 
@@ -318,6 +427,9 @@ public class BinlogReader extends AbstractReader {
             // Forward the event to the handler ...
             eventHandlers.getOrDefault(eventType, this::ignoreEvent).accept(event);
 
+            // Generate heartbeat message if the time is right
+            heartbeat.heartbeat((BlockingConsumer<SourceRecord>)this::enqueueRecord);
+
             // Capture that we've completed another event ...
             source.completeEvent();
 
@@ -326,9 +438,9 @@ public class BinlogReader extends AbstractReader {
                 --initialEventsToSkip;
                 skipEvent = initialEventsToSkip > 0;
             }
-
         } catch (RuntimeException e) {
             // There was an error in the event handler, so propagate the failure to Kafka Connect ...
+            logReaderState();
             failed(e, "Error processing binlog event");
             // Do not stop the client, since Kafka Connect should stop the connector on it's own
             // (and doing it here may cause problems the second time it is stopped).
@@ -343,6 +455,7 @@ public class BinlogReader extends AbstractReader {
         }
     }
 
+
     @SuppressWarnings("unchecked")
     protected <T extends EventData> T unwrapData(Event event) {
         EventData eventData = event.getData();
@@ -354,7 +467,7 @@ public class BinlogReader extends AbstractReader {
 
     /**
      * Handle the supplied event that signals that mysqld has stopped.
-     * 
+     *
      * @param event the server stopped event to be processed; may not be null
      */
     protected void handleServerStop(Event event) {
@@ -364,7 +477,7 @@ public class BinlogReader extends AbstractReader {
     /**
      * Handle the supplied event that is sent by a master to a slave to let the slave know that the master is still alive. Not
      * written to a binary log.
-     * 
+     *
      * @param event the server stopped event to be processed; may not be null
      */
     protected void handleServerHeartbeat(Event event) {
@@ -374,18 +487,54 @@ public class BinlogReader extends AbstractReader {
     /**
      * Handle the supplied event that signals that an out of the ordinary event that occurred on the master. It notifies the slave
      * that something happened on the master that might cause data to be in an inconsistent state.
-     * 
+     *
      * @param event the server stopped event to be processed; may not be null
      */
     protected void handleServerIncident(Event event) {
-        logger.trace("Server incident: {}", event);
+        if (event.getData() instanceof EventDataDeserializationExceptionData) {
+            EventDataDeserializationExceptionData data = event.getData();
+
+            EventHeaderV4 eventHeader = (EventHeaderV4) data.getCause().getEventHeader(); // safe cast, instantiated that ourselves
+
+            // logging some additional context but not the exception itself, this will happen in handleEvent()
+            if(eventDeserializationFailureHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
+                logger.error(
+                        "Error while deserializing binlog event at offset {}.{}" +
+                        "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
+                        source.offset(),
+                        System.lineSeparator(),
+                        eventHeader.getPosition(),
+                        eventHeader.getNextPosition(),
+                        source.binlogFilename()
+                );
+
+                throw new RuntimeException(data.getCause());
+            }
+            else if(eventDeserializationFailureHandlingMode == EventProcessingFailureHandlingMode.WARN) {
+                logger.warn(
+                        "Error while deserializing binlog event at offset {}.{}" +
+                        "This exception will be ignored and the event be skipped.{}" +
+                        "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
+                        source.offset(),
+                        System.lineSeparator(),
+                        System.lineSeparator(),
+                        eventHeader.getPosition(),
+                        eventHeader.getNextPosition(),
+                        source.binlogFilename(),
+                        data.getCause()
+                );
+            }
+        }
+        else {
+            logger.error("Server incident: {}", event);
+        }
     }
 
     /**
      * Handle the supplied event with a {@link RotateEventData} that signals the logs are being rotated. This means that either
      * the server was restarted, or the binlog has transitioned to a new file. In either case, subsequent table numbers will be
      * different than those seen to this point, so we need to {@link RecordMakers#clear() discard the cache of record makers}.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      */
     protected void handleRotateLogsEvent(Event event) {
@@ -405,7 +554,7 @@ public class BinlogReader extends AbstractReader {
      * we actually want to capture all GTID set values found in the binlog, whether or not we process them.
      * However, only when we connect do we actually want to pass to MySQL only those GTID ranges that are applicable
      * per the configuration.
-     * 
+     *
      * @param event the GTID event to be processed; may not be null
      */
     protected void handleGtidEvent(Event event) {
@@ -426,7 +575,7 @@ public class BinlogReader extends AbstractReader {
     /**
      * Handle the supplied event with an {@link QueryEventData} by possibly recording the DDL statements as changes in the
      * MySQL schemas.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while recording the DDL statements
      */
@@ -447,22 +596,35 @@ public class BinlogReader extends AbstractReader {
             return;
         }
         if (sql.equalsIgnoreCase("COMMIT")) {
-            // We are completing the transaction ...
-            source.commitTransaction();
-            source.setBinlogThread(-1L);
-            skipEvent = false;
-            ignoreDmlEventByGtidSource = false;
+            handleTransactionCompletion(event);
             return;
         }
         if (sql.toUpperCase().startsWith("XA ")) {
             // This is an XA transaction, and we currently ignore these and do nothing ...
             return;
         }
+        if (context.ddlFilter().test(sql)) {
+            logger.debug("DDL '{}' was filtered out of processing", sql);
+            return;
+        }
+        if (sql.equalsIgnoreCase("ROLLBACK")) {
+            // We have hit a ROLLBACK which is not supported
+            logger.warn("Rollback statements cannot be handled without binlog buffering, the connector will fail. Please check '{}' to see how to enable buffering",
+                    MySqlConnectorConfig.BUFFER_SIZE_FOR_BINLOG_READER.name());
+        }
         context.dbSchema().applyDdl(context.source(), command.getDatabase(), command.getSql(), (dbName, statements) -> {
             if (recordSchemaChangesInSourceRecords && recordMakers.schemaChanges(dbName, statements, super::enqueueRecord) > 0) {
                 logger.debug("Recorded DDL statements for database '{}': {}", dbName, statements);
             }
         });
+    }
+
+    private void handleTransactionCompletion(Event event) {
+        // We are completing the transaction ...
+        source.commitTransaction();
+        source.setBinlogThread(-1L);
+        skipEvent = false;
+        ignoreDmlEventByGtidSource = false;
     }
 
     /**
@@ -476,7 +638,7 @@ public class BinlogReader extends AbstractReader {
      * <li>the table structure is modified (e.g., via an {@code ALTER TABLE ...} command); or</li>
      * <li>MySQL rotates to a new binary log file, even if the table structure does not change.</li>
      * </ol>
-     * 
+     *
      * @param event the update event; never null
      */
     protected void handleUpdateTableMetadata(Event event) {
@@ -487,14 +649,71 @@ public class BinlogReader extends AbstractReader {
         TableId tableId = new TableId(databaseName, null, tableName);
         if (recordMakers.assign(tableNumber, tableId)) {
             logger.debug("Received update table metadata event: {}", event);
-        } else {
-            logger.debug("Skipping update table metadata event: {}", event);
+        }
+        else {
+            informAboutUnknownTableIfRequired(event, tableId, "update table metadata");
+        }
+    }
+
+    /**
+     * If we receive an event for a table that is monitored but whose metadata we
+     * don't know, either ignore that event or raise a warning or error as per the
+     * {@link MySqlConnectorConfig#INCONSISTENT_SCHEMA_HANDLING_MODE} configuration.
+     */
+    private void informAboutUnknownTableIfRequired(Event event, TableId tableId, String typeToLog) {
+        if (tableId != null && context.dbSchema().isTableMonitored(tableId)) {
+            EventHeaderV4 eventHeader = event.getHeader();
+
+            if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
+                logger.error(
+                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
+                        event,
+                        source.offset(),
+                        System.lineSeparator(),
+                        eventHeader.getPosition(),
+                        eventHeader.getNextPosition(),
+                        source.binlogFilename()
+                );
+                throw new ConnectException("Encountered change event for table whose schema isn't known to this connector");
+            }
+            else if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.WARN) {
+                logger.warn(
+                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "The event will be ignored.{}" +
+                        "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
+                        event,
+                        source.offset(),
+                        System.lineSeparator(),
+                        System.lineSeparator(),
+                        eventHeader.getPosition(),
+                        eventHeader.getNextPosition(),
+                        source.binlogFilename()
+                );
+            }
+            else {
+                logger.debug(
+                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "The event will be ignored.{}" +
+                        "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
+                        event,
+                        source.offset(),
+                        System.lineSeparator(),
+                        System.lineSeparator(),
+                        eventHeader.getPosition(),
+                        eventHeader.getNextPosition(),
+                        source.binlogFilename()
+                );
+            }
+        }
+        else {
+            logger.debug("Skipping {} event: {} for non-monitored table {}", typeToLog, event, tableId);
         }
     }
 
     /**
      * Generate source records for the supplied event with an {@link WriteRowsEventData}.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while blocking
      */
@@ -514,7 +733,7 @@ public class BinlogReader extends AbstractReader {
         RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns, super::enqueueRecord);
         if (recordMaker != null) {
             List<Serializable[]> rows = write.getRows();
-            Long ts = context.clock().currentTimeInMillis();
+            Long ts = context.getClock().currentTimeInMillis();
             int count = 0;
             int numRows = rows.size();
             if (startingRowNumber < numRows) {
@@ -533,15 +752,16 @@ public class BinlogReader extends AbstractReader {
                 // All rows were previously processed ...
                 logger.debug("Skipping previously processed insert event: {}", event);
             }
-        } else {
-            logger.debug("Skipping insert row event: {}", event);
+        }
+        else {
+            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "insert row");
         }
         startingRowNumber = 0;
     }
 
     /**
      * Generate source records for the supplied event with an {@link UpdateRowsEventData}.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while blocking
      */
@@ -562,7 +782,7 @@ public class BinlogReader extends AbstractReader {
         RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns, super::enqueueRecord);
         if (recordMaker != null) {
             List<Entry<Serializable[], Serializable[]>> rows = update.getRows();
-            Long ts = context.clock().currentTimeInMillis();
+            Long ts = context.getClock().currentTimeInMillis();
             int count = 0;
             int numRows = rows.size();
             if (startingRowNumber < numRows) {
@@ -584,15 +804,16 @@ public class BinlogReader extends AbstractReader {
                 // All rows were previously processed ...
                 logger.debug("Skipping previously processed update event: {}", event);
             }
-        } else {
-            logger.debug("Skipping update row event: {}", event);
+        }
+        else {
+            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "update row");
         }
         startingRowNumber = 0;
     }
 
     /**
      * Generate source records for the supplied event with an {@link DeleteRowsEventData}.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while blocking
      */
@@ -612,7 +833,7 @@ public class BinlogReader extends AbstractReader {
         RecordsForTable recordMaker = recordMakers.forTable(tableNumber, includedColumns, super::enqueueRecord);
         if (recordMaker != null) {
             List<Serializable[]> rows = deleted.getRows();
-            Long ts = context.clock().currentTimeInMillis();
+            Long ts = context.getClock().currentTimeInMillis();
             int count = 0;
             int numRows = rows.size();
             if (startingRowNumber < numRows) {
@@ -631,15 +852,16 @@ public class BinlogReader extends AbstractReader {
                 // All rows were previously processed ...
                 logger.debug("Skipping previously processed delete event: {}", event);
             }
-        } else {
-            logger.debug("Skipping delete row event: {}", event);
+        }
+        else {
+            informAboutUnknownTableIfRequired(event, recordMakers.getTableIdFromTableNumber(tableNumber), "delete row");
         }
         startingRowNumber = 0;
     }
 
     /**
      * Handle a {@link EventType#VIEW_CHANGE} event.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while blocking
      */
@@ -647,10 +869,10 @@ public class BinlogReader extends AbstractReader {
         logger.debug("View Change event: {}", event);
         // do nothing
     }
-    
+
     /**
      * Handle a {@link EventType#XA_PREPARE} event.
-     * 
+     *
      * @param event the database change data event to be processed; may not be null
      * @throws InterruptedException if this thread is interrupted while blocking
      */
@@ -658,7 +880,7 @@ public class BinlogReader extends AbstractReader {
         logger.debug("XA Prepare event: {}", event);
         // do nothing
     }
-    
+
     protected SSLMode sslModeFor(SecureConnectionMode mode) {
         switch (mode) {
             case DISABLED:
@@ -694,12 +916,13 @@ public class BinlogReader extends AbstractReader {
             context.configureLoggingContext("binlog");
 
             // The event row number will be used when processing the first event ...
-            logger.info("Connected to MySQL binlog at {}:{}, starting at {}", context.hostname(), context.port(), source);
+            logger.info("Connected to MySQL binlog at {}:{}, starting at {}", connectionContext.hostname(), connectionContext.port(), source);
         }
 
         @Override
         public void onCommunicationFailure(BinaryLogClient client, Exception ex) {
             logger.debug("A communication failure event arrived", ex);
+            logReaderState();
             try {
                 // Stop BinaryLogClient background threads
                 client.disconnect();
@@ -713,7 +936,27 @@ public class BinlogReader extends AbstractReader {
         @Override
         public void onEventDeserializationFailure(BinaryLogClient client, Exception ex) {
             logger.debug("A deserialization failure event arrived", ex);
+            logReaderState();
             BinlogReader.this.failed(ex);
         }
+    }
+
+    private void logReaderState() {
+        logger.error("Error during binlog processing. Last offset stored = {}, binlog reader near position = {}",
+                lastOffset,
+                client == null ? "N/A" : client.getBinlogFilename() + "/" + client.getBinlogPosition()
+        );
+    }
+
+    protected BinlogReaderMetrics getMetrics() {
+        return metrics;
+    }
+
+    protected BinaryLogClient getBinlogClient() {
+        return client;
+    }
+
+    public BinlogPosition getCurrentBinlogPosition() {
+        return new BinlogPosition(client.getBinlogFilename(), client.getBinlogPosition());
     }
 }

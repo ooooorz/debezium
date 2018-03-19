@@ -21,25 +21,26 @@ import org.junit.Test;
 
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.time.Date;
-import io.debezium.util.AvroValidator;
+import io.debezium.util.SchemaNameAdjuster;
 
 public class TableSchemaBuilderTest {
 
     private final String prefix = "";
     private final TableId id = new TableId("catalog", "schema", "table");
-    private final Object[] data = new Object[] { "c1value", 3.142d, java.sql.Date.valueOf("2001-10-31"), 4, new byte[]{ 71, 117, 110, 110, 97, 114} };
+    private final Object[] data = new Object[] { "c1value", 3.142d, java.sql.Date.valueOf("2001-10-31"), 4, new byte[]{ 71, 117, 110, 110, 97, 114}, null };
     private Table table;
     private Column c1;
     private Column c2;
     private Column c3;
     private Column c4;
     private Column c5;
+    private Column c6;
     private TableSchema schema;
-    private AvroValidator validator;
+    private SchemaNameAdjuster adjuster;
 
     @Before
     public void beforeEach() {
-        validator = AvroValidator.create((original,replacement, conflict)->{
+        adjuster = SchemaNameAdjuster.create((original,replacement, conflict)->{
             fail("Should not have come across an invalid schema name");
         });
         schema = null;
@@ -66,6 +67,11 @@ public class TableSchemaBuilderTest {
                                        .type("BINARY").jdbcType(Types.BINARY)
                                        .optional(false)
                                        .length(16)
+                                       .create(),
+                                 Column.editor().name("C6")
+                                       .type("SMALLINT").jdbcType(Types.SMALLINT)
+                                       .optional(false)
+                                       .length(1)
                                        .create())
                      .setPrimaryKeyNames("C1", "C2")
                      .create();
@@ -74,6 +80,7 @@ public class TableSchemaBuilderTest {
         c3 = table.columnWithName("C3");
         c4 = table.columnWithName("C4");
         c5 = table.columnWithName("C5");
+        c6 = table.columnWithName("C6");
     }
 
     @Test
@@ -83,23 +90,27 @@ public class TableSchemaBuilderTest {
         assertThat(c3).isNotNull();
         assertThat(c4).isNotNull();
         assertThat(c5).isNotNull();
+        assertThat(c6).isNotNull();
     }
 
     @Test(expected = NullPointerException.class)
     public void shouldFailToBuildTableSchemaFromNullTable() {
-        new TableSchemaBuilder(new JdbcValueConverters(),validator::validate).create(prefix,null);
+        new TableSchemaBuilder(new JdbcValueConverters(), adjuster, SchemaBuilder.struct().build())
+                .create(prefix, "sometopic", null, null, null);
     }
 
     @Test
     public void shouldBuildTableSchemaFromTable() {
-        schema = new TableSchemaBuilder(new JdbcValueConverters(),validator::validate).create(prefix,table);
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), adjuster, SchemaBuilder.struct().build())
+                .create(prefix, "sometopic", table, null, null);
         assertThat(schema).isNotNull();
     }
 
     @Test
     public void shouldBuildTableSchemaFromTableWithoutPrimaryKey() {
         table = table.edit().setPrimaryKeyNames().create();
-        schema = new TableSchemaBuilder(new JdbcValueConverters(),validator::validate).create(prefix,table);
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), adjuster, SchemaBuilder.struct().build())
+                .create(prefix, "sometopic", table, null, null);
         assertThat(schema).isNotNull();
         // Check the keys ...
         assertThat(schema.keySchema()).isNull();
@@ -121,6 +132,8 @@ public class TableSchemaBuilderTest {
         assertThat(values.field("C4").schema()).isEqualTo(SchemaBuilder.int32().optional().build()); // JDBC INTEGER = 32 bits
         assertThat(values.field("C5").index()).isEqualTo(4);
         assertThat(values.field("C5").schema()).isEqualTo(SchemaBuilder.bytes().build()); // JDBC BINARY = bytes
+        assertThat(values.field("C6").index()).isEqualTo(5);
+        assertThat(values.field("C6").schema()).isEqualTo(SchemaBuilder.int16().build());
 
         Struct value = schema.valueFromColumnData(data);
         assertThat(value).isNotNull();
@@ -129,6 +142,7 @@ public class TableSchemaBuilderTest {
         assertThat(value.get("C3")).isEqualTo(11626);
         assertThat(value.get("C4")).isEqualTo(4);
         assertThat(value.get("C5")).isEqualTo(ByteBuffer.wrap(new byte[]{ 71, 117, 110, 110, 97, 114}));
+        assertThat(value.get("C6")).isEqualTo(Short.valueOf((short) 0));
     }
 
 }
