@@ -9,7 +9,6 @@ package io.debezium.connector.postgresql;
 import java.sql.SQLException;
 import java.time.ZoneOffset;
 import java.util.Map;
-import java.util.function.Predicate;
 
 import org.apache.kafka.connect.data.Schema;
 import org.slf4j.Logger;
@@ -24,6 +23,7 @@ import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchemaBuilder;
 import io.debezium.relational.Tables;
+import io.debezium.schema.TopicSelector;
 import io.debezium.util.SchemaNameAdjuster;
 
 /**
@@ -51,7 +51,7 @@ public class PostgresSchema extends RelationalDatabaseSchema {
      * @param config the connector configuration, which is presumed to be valid
      */
     protected PostgresSchema(PostgresConnectorConfig config, TypeRegistry typeRegistry,
-            PostgresTopicSelector topicSelector) {
+            TopicSelector<TableId> topicSelector) {
         super(config, topicSelector, new Filters(config).tableFilter(),
                 new Filters(config).columnFilter(), getTableSchemaBuilder(config, typeRegistry), false);
 
@@ -80,7 +80,7 @@ public class PostgresSchema extends RelationalDatabaseSchema {
         }
 
         // read all the information from the DB
-        connection.readSchema(tables(), null, null, filters.tableNameFilter(), null, true);
+        connection.readSchema(tables(), null, null, filters.tableFilter(), null, true);
         if (printReplicaIdentityInfo) {
             // print out all the replica identity info
             tableIds().forEach(tableId -> printReplicaIdentityInfo(connection, tableId));
@@ -108,8 +108,7 @@ public class PostgresSchema extends RelationalDatabaseSchema {
      */
     protected void refresh(PostgresConnection connection, TableId tableId) throws SQLException {
         Tables temp = new Tables();
-        Tables.TableNameFilter tableNameFilter = Tables.filterFor(Predicate.isEqual(tableId));
-        connection.readSchema(temp, null, null, tableNameFilter, null, true);
+        connection.readSchema(temp, null, null, tableId::equals, null, true);
 
         // we expect the refreshed table to be there
         assert temp.size() == 1;
@@ -132,7 +131,7 @@ public class PostgresSchema extends RelationalDatabaseSchema {
     }
 
     protected boolean isFilteredOut(TableId id) {
-        return !filters.tableFilter().test(id);
+        return !filters.tableFilter().isIncluded(id);
     }
 
     /**

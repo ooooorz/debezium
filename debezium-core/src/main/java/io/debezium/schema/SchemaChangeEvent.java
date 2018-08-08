@@ -12,6 +12,11 @@ import java.util.Set;
 
 import io.debezium.relational.Table;
 
+/**
+ * Represents a structural change to a database schema.
+ *
+ * @author Gunnar Morling
+ */
 public class SchemaChangeEvent {
 
     private final String database;
@@ -32,7 +37,8 @@ public class SchemaChangeEvent {
         this.offset = Objects.requireNonNull(offset, "offset must not be null");
         this.database = Objects.requireNonNull(database, "database must not be null");
         this.schema = Objects.requireNonNull(schema, "schema must not be null");
-        this.ddl = Objects.requireNonNull(ddl, "ddl must not be null");
+        // DDL is not mandatory
+        this.ddl = ddl;
         this.tables = Objects.requireNonNull(tables, "tables must not be null");
         this.type = Objects.requireNonNull(type, "type must not be null");
         this.isFromSnapshot = isFromSnapshot;

@@ -13,12 +13,14 @@ import java.util.function.Predicate;
 import org.apache.kafka.connect.data.Schema;
 
 import io.debezium.config.CommonConnectorConfig;
+import io.debezium.relational.Tables.TableFilter;
 import io.debezium.relational.mapping.ColumnMappers;
 import io.debezium.schema.DatabaseSchema;
 import io.debezium.schema.TopicSelector;
 
 /**
- * A {@link DatabaseSchema} of a relational database such as Postgres.
+ * A {@link DatabaseSchema} of a relational database such as Postgres. Provides information about the physical structure
+ * of the database (the "database schema") as well as the structure of corresponding CDC messages (the "event schema").
  *
  * @author Gunnar Morling
  */
@@ -26,7 +28,7 @@ public abstract class RelationalDatabaseSchema implements DatabaseSchema<TableId
 
     private final TopicSelector<TableId> topicSelector;
     private final TableSchemaBuilder schemaBuilder;
-    private final Predicate<TableId> tableFilter;
+    private final TableFilter tableFilter;
     private final Predicate<ColumnId> columnFilter;
     private final ColumnMappers columnMappers;
 
@@ -35,7 +37,7 @@ public abstract class RelationalDatabaseSchema implements DatabaseSchema<TableId
     private final Tables tables;
 
     protected RelationalDatabaseSchema(CommonConnectorConfig config, TopicSelector<TableId> topicSelector,
-            Predicate<TableId> tableFilter, Predicate<ColumnId> columnFilter, TableSchemaBuilder schemaBuilder,
+            TableFilter tableFilter, Predicate<ColumnId> columnFilter, TableSchemaBuilder schemaBuilder,
             boolean tableIdCaseInsensitive) {
 
         this.topicSelector = topicSelector;
@@ -96,7 +98,7 @@ public abstract class RelationalDatabaseSchema implements DatabaseSchema<TableId
      *         or if the table has been excluded by the filters
      */
     public Table tableFor(TableId id) {
-        return tableFilter.test(id) ? tables.forTable(id) : null;
+        return tableFilter.isIncluded(id) ? tables.forTable(id) : null;
     }
 
     protected Tables tables() {
@@ -107,8 +109,11 @@ public abstract class RelationalDatabaseSchema implements DatabaseSchema<TableId
         schemasByTableId.clear();
     }
 
+    /**
+     * Builds up the CDC event schema for the given table and stores it in this schema.
+     */
     protected void buildAndRegisterSchema(Table table) {
-        if (tableFilter.test(table.id())) {
+        if (tableFilter.isIncluded(table.id())) {
             TableSchema schema = schemaBuilder.create(schemaPrefix, getEnvelopeSchemaName(table), table, columnFilter, columnMappers);
             schemasByTableId.put(table.id(), schema);
         }
