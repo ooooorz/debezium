@@ -6,6 +6,7 @@
 
 package io.debezium.connector.postgresql;
 
+import java.nio.charset.Charset;
 import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
@@ -39,7 +40,12 @@ public class PostgresConnectorTask extends BaseSourceTask {
 
     private PostgresTaskContext taskContext;
     private RecordsProducer producer;
-    private volatile long lastProcessedLsn;
+
+    /**
+     * In case of wal2json, all records of one TX will be sent with the same LSN. This is the last LSN that was
+     * completely processed, i.e. we've seen all events originating from that TX.
+     */
+    private volatile Long lastCompletelyProcessedLsn;
 
     /**
      * A queue with change events filled by the snapshot and streaming producers, consumed
@@ -56,18 +62,20 @@ public class PostgresConnectorTask extends BaseSourceTask {
 
         PostgresConnectorConfig connectorConfig = new PostgresConnectorConfig(config);
 
-        // Create type registry
         TypeRegistry typeRegistry;
+        Charset databaseCharset;
+
         try (final PostgresConnection connection = new PostgresConnection(connectorConfig.jdbcConfig())) {
             typeRegistry = connection.getTypeRegistry();
+            databaseCharset = connection.getDatabaseCharset();
         }
 
         // create the task context and schema...
         TopicSelector<TableId> topicSelector = PostgresTopicSelector.create(connectorConfig);
-        PostgresSchema schema = new PostgresSchema(connectorConfig, typeRegistry, topicSelector);
+        PostgresSchema schema = new PostgresSchema(connectorConfig, typeRegistry, databaseCharset, topicSelector);
         this.taskContext = new PostgresTaskContext(connectorConfig, schema, topicSelector);
 
-        SourceInfo sourceInfo = new SourceInfo(connectorConfig.getLogicalName());
+        SourceInfo sourceInfo = new SourceInfo(connectorConfig.getLogicalName(), connectorConfig.databaseName());
         Map<String, Object> existingOffset = context.offsetStorageReader().offset(sourceInfo.partition());
         LoggingContext.PreviousContext previousContext = taskContext.configureLoggingContext(CONTEXT_NAME);
         try {
@@ -137,7 +145,9 @@ public class PostgresConnectorTask extends BaseSourceTask {
     @Override
     public void commit() throws InterruptedException {
         if (running.get()) {
-            producer.commit(lastProcessedLsn);
+            if (lastCompletelyProcessedLsn != null) {
+                producer.commit(lastCompletelyProcessedLsn);
+            }
         }
     }
 
@@ -146,14 +156,7 @@ public class PostgresConnectorTask extends BaseSourceTask {
         List<ChangeEvent> events = changeEventQueue.poll();
 
         if (events.size() > 0) {
-            for (int i = events.size() - 1; i >= 0; i--) {
-                SourceRecord r = events.get(i).getRecord();
-                if (events.get(i).isLastOfLsn()) {
-                    Map<String, ?> offset = r.sourceOffset();
-                    lastProcessedLsn = (Long)offset.get(SourceInfo.LSN_KEY);
-                    break;
-                }
-            }
+            lastCompletelyProcessedLsn = events.get(events.size() - 1).getLastCompletelyProcessedLsn();
         }
         return events.stream().map(ChangeEvent::getRecord).collect(Collectors.toList());
     }

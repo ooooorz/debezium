@@ -1,10 +1,20 @@
-# Job definition to test PostgreSQL connector with wal2json decoder without metadata
+# Job definition to test MongoDB connector against MongoDB
 ---
 - job:
-    project-type: freestyle
-    name: debezium-postgresql-test-wal2json-legacy
-    display-name: Debezium PostgreSQL(wal2json w/o metadata) Test
-    description: Executes tests for wal2json decoder without metadata
+    project-type: matrix
+    name: debezium-mongodb-matrix-test
+    display-name: Debezium MongoDB Test Matrix
+    description: Executes tests for MongoDB Connector with MongoDB matrix
+    execution-strategy:
+      sequential: true
+    axes:
+      - axis:
+          type: user-defined
+          name: MONGODB_VERSION
+          values:
+            - 3.2
+            - 3.4
+            - 4.0
     node: Slave
     properties:
       - build-discarder:
@@ -30,11 +40,12 @@
           timeout: 45
     triggers:
       - reverse:
-          jobs: 'debezium-postgresql-9.6-legacy-test'
+          jobs: 'debezium-postgresql-matrix-test'
+          result: 'failure'
     builders:
       - maven-target:
           maven-version: (Default)
-          goals: clean install -U -s $HOME/.m2/settings-snapshots.xml -pl debezium-connector-postgres -am -fae -Dmaven.test.failure.ignore=true -Dpostgres.port=55432 -Dversion.postgres.server=9.6-legacy -Pwal2json-decoder
+          goals: clean install -U -s $HOME/.m2/settings-snapshots.xml -pl debezium-connector-mongodb -am -fae -Dmaven.test.failure.ignore=true -Dversion.mongo.server=$MONGODB_VERSION
     publishers:
       - junit:
           results: "**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml"

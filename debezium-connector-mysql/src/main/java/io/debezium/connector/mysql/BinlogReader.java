@@ -20,6 +20,7 @@ import java.util.function.Predicate;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.slf4j.event.Level;
 
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
 import com.github.shyiko.mysql.binlog.BinaryLogClient.LifecycleListener;
@@ -232,14 +233,14 @@ public class BinlogReader extends AbstractReader {
         client.setEventDeserializer(eventDeserializer);
 
         // Set up for JMX ...
-        metrics = new BinlogReaderMetrics(client, context.dbSchema());
+        metrics = new BinlogReaderMetrics(client, context);
         heartbeat = Heartbeat.create(context.config(), context.topicSelector().getHeartbeatTopic(),
                 context.getConnectorConfig().getLogicalName());
     }
 
     @Override
     protected void doInitialize() {
-        metrics.register(context, logger);
+        metrics.register(logger);
     }
 
     @Override
@@ -273,13 +274,18 @@ public class BinlogReader extends AbstractReader {
 
         // Get the current GtidSet from MySQL so we can get a filtered/merged GtidSet based off of the last Debezium checkpoint.
         String availableServerGtidStr = connectionContext.knownGtidSet();
-        if (availableServerGtidStr != null && !availableServerGtidStr.trim().isEmpty()) {
+        if (connectionContext.isGtidModeEnabled()) {
             // The server is using GTIDs, so enable the handler ...
             eventHandlers.put(EventType.GTID, this::handleGtidEvent);
 
             // Now look at the GTID set from the server and what we've previously seen ...
             GtidSet availableServerGtidSet = new GtidSet(availableServerGtidStr);
-            GtidSet filteredGtidSet = context.filterGtidSet(availableServerGtidSet);
+
+            // also take into account purged GTID logs
+            GtidSet purgedServerGtidSet = connectionContext.purgedGtidSet();
+            logger.info("GTID set purged on server: {}", purgedServerGtidSet);
+
+            GtidSet filteredGtidSet = context.filterGtidSet(availableServerGtidSet, purgedServerGtidSet);
             if (filteredGtidSet != null) {
                 // We've seen at least some GTIDs, so start reading from the filtered GTID set ...
                 logger.info("Registering binlog reader with GTID set: {}", filteredGtidSet);
@@ -687,24 +693,26 @@ public class BinlogReader extends AbstractReader {
 
             if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
                 logger.error(
-                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
                         "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event,
                         source.offset(),
+                        tableId,
                         System.lineSeparator(),
                         eventHeader.getPosition(),
                         eventHeader.getNextPosition(),
                         source.binlogFilename()
                 );
-                throw new ConnectException("Encountered change event for table whose schema isn't known to this connector");
+                throw new ConnectException("Encountered change event for table " + tableId + "whose schema isn't known to this connector");
             }
             else if (inconsistentSchemaHandlingMode == EventProcessingFailureHandlingMode.WARN) {
                 logger.warn(
-                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
                         "The event will be ignored.{}" +
                         "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event,
                         source.offset(),
+                        tableId,
                         System.lineSeparator(),
                         System.lineSeparator(),
                         eventHeader.getPosition(),
@@ -714,11 +722,12 @@ public class BinlogReader extends AbstractReader {
             }
             else {
                 logger.debug(
-                        "Encountered change event '{}' at offset {} for table whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
+                        "Encountered change event '{}' at offset {} for table {} whose schema isn't known to this connector. One possible cause is an incomplete database history topic. Take a new snapshot in this case.{}" +
                         "The event will be ignored.{}" +
                         "Use the mysqlbinlog tool to view the problematic event: mysqlbinlog --start-position={} --stop-position={} --verbose {}",
                         event,
                         source.offset(),
+                        tableId,
                         System.lineSeparator(),
                         System.lineSeparator(),
                         eventHeader.getPosition(),
@@ -956,17 +965,39 @@ public class BinlogReader extends AbstractReader {
 
         @Override
         public void onEventDeserializationFailure(BinaryLogClient client, Exception ex) {
-            logger.debug("A deserialization failure event arrived", ex);
-            logReaderState();
-            BinlogReader.this.failed(ex);
+            if(eventDeserializationFailureHandlingMode == EventProcessingFailureHandlingMode.FAIL) {
+                logger.debug("A deserialization failure event arrived", ex);
+                logReaderState();
+                BinlogReader.this.failed(ex);
+            }
+            else if(eventDeserializationFailureHandlingMode == EventProcessingFailureHandlingMode.WARN) {
+                logger.warn("A deserialization failure event arrived", ex);
+                logReaderState(Level.WARN);
+            }
+            else {
+                logger.debug("A deserialization failure event arrived", ex);
+                logReaderState(Level.DEBUG);
+            }
         }
     }
 
     private void logReaderState() {
-        logger.error("Error during binlog processing. Last offset stored = {}, binlog reader near position = {}",
-                lastOffset,
-                client == null ? "N/A" : client.getBinlogFilename() + "/" + client.getBinlogPosition()
-        );
+        logReaderState(Level.ERROR);
+    }
+
+    private void logReaderState(Level severity) {
+        final Object position = client == null ? "N/A" : client.getBinlogFilename() + "/" + client.getBinlogPosition();
+        final String message = "Error during binlog processing. Last offset stored = {}, binlog reader near position = {}";
+        switch (severity) {
+        case WARN:
+            logger.warn(message, lastOffset, position);
+            break;
+        case DEBUG:
+            logger.debug(message, lastOffset, position);
+            break;
+        default:
+            logger.error(message, lastOffset, position);
+        }
     }
 
     protected BinlogReaderMetrics getMetrics() {

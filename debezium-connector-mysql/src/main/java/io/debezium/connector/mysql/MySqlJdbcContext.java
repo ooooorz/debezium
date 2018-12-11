@@ -35,8 +35,10 @@ import io.debezium.util.Strings;
  */
 public class MySqlJdbcContext implements AutoCloseable {
 
-    protected static final String MYSQL_CONNECTION_URL = "jdbc:mysql://${hostname}:${port}/?useInformationSchema=true&nullCatalogMeansCurrent=false&useSSL=${useSSL}&useUnicode=true&characterEncoding=UTF-8&characterSetResults=UTF-8&zeroDateTimeBehavior=convertToNull";
+    protected static final String MYSQL_CONNECTION_URL = "jdbc:mysql://${hostname}:${port}/?useInformationSchema=true&nullCatalogMeansCurrent=false&useSSL=${useSSL}&useUnicode=true&characterEncoding=UTF-8&characterSetResults=UTF-8&zeroDateTimeBehavior=CONVERT_TO_NULL";
     protected static final String JDBC_PROPERTY_LEGACY_DATETIME = "useLegacyDatetimeCode";
+    private static final String SQL_SHOW_SYSTEM_VARIABLES = "SHOW VARIABLES";
+    private static final String SQL_SHOW_SYSTEM_VARIABLES_CHARACTER_SET = "SHOW VARIABLES WHERE Variable_name IN ('character_set_server','collation_server')";
 
     protected static ConnectionFactory FACTORY = JdbcConnection.patternBasedFactory(MYSQL_CONNECTION_URL);
 
@@ -155,6 +157,26 @@ public class MySqlJdbcContext implements AutoCloseable {
     }
 
     /**
+     * Determine whether the MySQL server has GTIDs enabled.
+     *
+     * @return {@code false} if the server's {@code gtid_mode} is set and is {@code OFF}, or {@code true} otherwise
+     */
+    public boolean isGtidModeEnabled() {
+        AtomicReference<String> mode = new AtomicReference<String>("off");
+        try {
+            jdbc().query("SHOW GLOBAL VARIABLES LIKE 'GTID_MODE'", rs -> {
+                if (rs.next()) {
+                    mode.set(rs.getString(2));
+                }
+            });
+        } catch (SQLException e) {
+            throw new ConnectException("Unexpected error while connecting to MySQL and looking at GTID mode: ", e);
+        }
+
+        return !"OFF".equalsIgnoreCase(mode.get());
+    }
+
+    /**
      * Determine the available GTID set for MySQL.
      *
      * @return the string representation of MySQL's GTID sets; never null but an empty string if the server does not use GTIDs
@@ -173,6 +195,32 @@ public class MySqlJdbcContext implements AutoCloseable {
 
         String result = gtidSetStr.get();
         return result != null ? result : "";
+    }
+
+    /**
+     * Get the purged GTID values from MySQL (gtid_purged value)
+     *
+     * @return A GTID set; may be empty if not using GTIDs or none have been purged yet
+     */
+    public GtidSet purgedGtidSet() {
+        AtomicReference<String> gtidSetStr = new AtomicReference<String>();
+        try {
+            jdbc.query("SHOW GLOBAL VARIABLES LIKE \"gtid_purged\"", rs -> {
+                if (rs.next() && rs.getMetaData().getColumnCount() > 1) {
+                    gtidSetStr.set(rs.getString(2));// GTID set, may be null, blank, or contain a GTID set
+                }
+            });
+        }
+        catch (SQLException e) {
+            throw new ConnectException("Unexpected error while connecting to MySQL and looking at gtid_purged variable: ", e);
+        }
+
+        String result = gtidSetStr.get();
+        if (result == null) {
+            result = "";
+        }
+
+        return new GtidSet(result);
     }
 
     /**
@@ -209,47 +257,28 @@ public class MySqlJdbcContext implements AutoCloseable {
     /**
      * Read the MySQL charset-related system variables.
      *
-     * @param sql the reference that should be set to the SQL statement; may be null if not needed
      * @return the system variables that are related to server character sets; never null
      */
-    protected Map<String, String> readMySqlCharsetSystemVariables(AtomicReference<String> sql) {
+    protected Map<String, String> readMySqlCharsetSystemVariables() {
         // Read the system variables from the MySQL instance and get the current database name ...
-        Map<String, String> variables = new HashMap<>();
-        try (JdbcConnection mysql = jdbc.connect()) {
-            logger.debug("Reading MySQL charset-related system variables before parsing DDL history.");
-            String statement = "SHOW VARIABLES WHERE Variable_name IN ('character_set_server','collation_server')";
-            if (sql != null) sql.set(statement);
-            mysql.query(statement, rs -> {
-                while (rs.next()) {
-                    String varName = rs.getString(1);
-                    String value = rs.getString(2);
-                    if (varName != null && value != null) {
-                        variables.put(varName, value);
-                        logger.debug("\t{} = {}",
-                                     Strings.pad(varName, 45, ' '),
-                                     Strings.pad(value, 45, ' '));
-                    }
-                }
-            });
-        } catch (SQLException e) {
-            throw new ConnectException("Error reading MySQL variables: " + e.getMessage(), e);
-        }
-        return variables;
+        logger.debug("Reading MySQL charset-related system variables before parsing DDL history.");
+        return querySystemVariables(SQL_SHOW_SYSTEM_VARIABLES_CHARACTER_SET);
     }
 
     /**
      * Read the MySQL system variables.
      *
-     * @param sql the reference that should be set to the SQL statement; may be null if not needed
      * @return the system variables that are related to server character sets; never null
      */
-    protected Map<String, String> readMySqlSystemVariables(AtomicReference<String> sql) {
+    protected Map<String, String> readMySqlSystemVariables() {
         // Read the system variables from the MySQL instance and get the current database name ...
+        logger.debug("Reading MySQL system variables");
+        return querySystemVariables(SQL_SHOW_SYSTEM_VARIABLES);
+    }
+
+    private Map<String, String> querySystemVariables(String statement) {
         Map<String, String> variables = new HashMap<>();
         try (JdbcConnection mysql = jdbc.connect()) {
-            logger.debug("Reading MySQL system variables");
-            String statement = "SHOW VARIABLES";
-            if (sql != null) sql.set(statement);
             mysql.query(statement, rs -> {
                 while (rs.next()) {
                     String varName = rs.getString(1);
@@ -265,6 +294,7 @@ public class MySqlJdbcContext implements AutoCloseable {
         } catch (SQLException e) {
             throw new ConnectException("Error reading MySQL variables: " + e.getMessage(), e);
         }
+
         return variables;
     }
 

@@ -6,7 +6,6 @@
 
 package io.debezium.connector.postgresql;
 
-import java.math.BigDecimal;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -27,43 +26,38 @@ import io.debezium.connector.postgresql.connection.wal2json.NonStreamingWal2Json
 import io.debezium.connector.postgresql.connection.wal2json.StreamingWal2JsonMessageDecoder;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConfiguration;
-import io.debezium.jdbc.JdbcValueConverters.DecimalMode;
 import io.debezium.jdbc.TemporalPrecisionMode;
+import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.TableId;
+
 
 /**
  * The configuration properties for the {@link PostgresConnector}
  *
  * @author Horia Chiorean
  */
-public class PostgresConnectorConfig extends CommonConnectorConfig {
+public class PostgresConnectorConfig extends RelationalDatabaseConnectorConfig {
 
     /**
-     * The set of predefined DecimalHandlingMode options or aliases.
+     * The set of predefined HStoreHandlingMode options or aliases
      */
-    public enum DecimalHandlingMode implements EnumeratedValue {
-        /**
-         * Represent {@code DECIMAL} and {@code NUMERIC} values as precise {@link BigDecimal} values, which are
-         * represented in change events in a binary form. This is precise but difficult to use.
-         */
-        PRECISE("precise"),
+    public enum HStoreHandlingMode implements EnumeratedValue {
 
         /**
-         * Represent {@code DECIMAL} and {@code NUMERIC} values as a string values. This is precise, it supports also special values
-         * but the type information is lost.
+         * Represents HStore value as json
          */
-        STRING("string"),
+        JSON("json"),
 
         /**
-         * Represent {@code DECIMAL} and {@code NUMERIC} values as precise {@code double} values. This may be less precise
-         * but is far easier to use.
+         * Represents HStore value as map
          */
-        DOUBLE("double");
+        MAP("map");
+
 
         private final String value;
 
-        private DecimalHandlingMode(String value) {
-            this.value = value;
+        HStoreHandlingMode(String value){
+            this.value=value;
         }
 
         @Override
@@ -71,43 +65,31 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
             return value;
         }
 
-        public DecimalMode asDecimalMode() {
-            switch (this) {
-                case DOUBLE:
-                    return DecimalMode.DOUBLE;
-                case STRING:
-                    return DecimalMode.STRING;
-                case PRECISE:
-                default:
-                    return DecimalMode.PRECISE;
-            }
-        }
-
         /**
-         * Determine if the supplied value is one of the predefined options.
+         * Determine if the supplied values is one of the predefined options
          *
-         * @param value the configuration property value; may not be null
-         * @return the matching option, or null if no match is found
+         * @param value the configuration property value ; may not be null
+         * @return the matching option, or null if the match is not found
          */
-        public static DecimalHandlingMode parse(String value) {
-            if (value == null) return null;
+        public static HStoreHandlingMode parse(String value){
+            if (value == null) return null ;
             value = value.trim();
-            for (DecimalHandlingMode option : DecimalHandlingMode.values()) {
-                if (option.getValue().equalsIgnoreCase(value)) return option;
+            for (HStoreHandlingMode option: HStoreHandlingMode.values()) {
+                if(option.getValue().equalsIgnoreCase(value)) return option;
             }
             return null;
         }
 
         /**
-         * Determine if the supplied value is one of the predefined options.
+         * Determine if the supplied values is one of the predefined options
          *
-         * @param value the configuration property value; may not be null
-         * @param defaultValue the default value; may be null
-         * @return the matching option, or null if no match is found and the non-null default is invalid
+         * @param value the configuration property value ; may not be null
+         * @param defaultValue the default value ; may be null
+         * @return the matching option or null if the match is not found and non-null default is invalid
          */
-        public static DecimalHandlingMode parse(String value, String defaultValue) {
-            DecimalHandlingMode mode = parse(value);
-            if (mode == null && defaultValue != null) mode = parse(defaultValue);
+        public static HStoreHandlingMode parse(String value,String defaultValue){
+            HStoreHandlingMode mode = parse(value);
+            if(mode == null && defaultValue != null ) mode = parse(defaultValue);
             return mode;
         }
     }
@@ -313,11 +295,21 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
             public MessageDecoder messageDecoder() {
                 return new PgProtoMessageDecoder();
             }
+
+            @Override
+            public String getPostgresPluginName() {
+                return getValue();
+            }
         },
         WAL2JSON_STREAMING("wal2json_streaming") {
             @Override
             public MessageDecoder messageDecoder() {
                 return new StreamingWal2JsonMessageDecoder();
+            }
+
+            @Override
+            public String getPostgresPluginName() {
+                return "wal2json";
             }
         },
         WAL2JSON_RDS_STREAMING("wal2json_rds_streaming") {
@@ -385,8 +377,53 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
             return decoderName;
         }
 
-        public String getPostgresPluginName() {
-            return getValue();
+        public abstract String getPostgresPluginName();
+    }
+
+    /**
+     * The set of predefined SchemaRefreshMode options or aliases.
+     */
+    public enum SchemaRefreshMode implements EnumeratedValue {
+        /**
+         * Refresh the in-memory schema cache whenever there is a discrepancy between it and the schema derived from the
+         * incoming message.
+         */
+        COLUMNS_DIFF("columns_diff"),
+
+        /**
+         * Refresh the in-memory schema cache if there is a discrepancy between it and the schema derived from the
+         * incoming message, unless TOASTable data can account for the discrepancy.
+         *
+         * This setting can improve connector performance significantly if there are frequently-updated tables that
+         * have TOASTed data that are rarely part of these updates. However, it is possible for the in-memory schema to
+         * become outdated if TOASTable columns are dropped from the table.
+         */
+        COLUMNS_DIFF_EXCLUDE_UNCHANGED_TOAST("columns_diff_exclude_unchanged_toast");
+
+        private final String value;
+
+        SchemaRefreshMode(String value) {
+            this.value = value;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @return the matching option, or null if no match is found
+         */
+        public static SchemaRefreshMode parse(String value) {
+            if (value == null) return null;
+            value = value.trim();
+            for (SchemaRefreshMode option : SchemaRefreshMode.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) return option;
+            }
+            return null;
         }
     }
 
@@ -656,52 +693,66 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
                                                                  + "'connect' always represents time, date, and timestamp values using Kafka Connect's built-in representations for Time, Date, and Timestamp, "
                                                                  + "which uses millisecond precision regardless of the database columns' precision .");
 
-    public static final Field DECIMAL_HANDLING_MODE = Field.create("decimal.handling.mode")
-                                                        .withDisplayName("Decimal Handling")
-                                                        .withEnum(DecimalHandlingMode.class, DecimalHandlingMode.PRECISE)
-                                                        .withWidth(Width.SHORT)
-                                                        .withImportance(Importance.MEDIUM)
-                                                        .withDescription("Specify how DECIMAL and NUMERIC columns should be represented in change events, including:"
-                                                                + "'precise' (the default) uses java.math.BigDecimal to represent values, which are encoded in the change events using a binary representation and Kafka Connect's 'org.apache.kafka.connect.data.Decimal' type; "
-                                                                + "'string' uses string to represent values (including the special ones like NaN or Infinity); "
-                                                                + "'double' represents values using Java's 'double', which may not offer the precision but will be far easier to use in consumers.");
+    public static final Field HSTORE_HANDLING_MODE = Field.create("hstore.handling.mode")
+                                                          .withDisplayName("HStore Handling")
+                                                          .withEnum(HStoreHandlingMode.class, HStoreHandlingMode.JSON)
+                                                          .withWidth(Width.MEDIUM)
+                                                          .withImportance(Importance.LOW)
+                                                          .withDescription("Specify how HSTORE columns should be represented in change events, including:"
+                                                                + "'json' represents values as json string"
+                                                                + "'map' (default) represents values using java.util.Map");
 
     public static final Field STATUS_UPDATE_INTERVAL_MS = Field.create("status.update.interval.ms")
-            .withDisplayName("Status update interval (ms)")
-            .withType(Type.INT) // Postgres doesn't accept long for this value
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("Frequency in milliseconds for sending replication connection status updates to the server. Defaults to 10 seconds (10000 ms).")
-            .withValidation(Field::isPositiveInteger);
+                                                          .withDisplayName("Status update interval (ms)")
+                                                          .withType(Type.INT) // Postgres doesn't accept long for this value
+                                                          .withWidth(Width.SHORT)
+                                                          .withImportance(Importance.MEDIUM)
+                                                          .withDescription("Frequency in milliseconds for sending replication connection status updates to the server. Defaults to 10 seconds (10000 ms).")
+                                                          .withValidation(Field::isPositiveInteger);
 
     public static final Field TCP_KEEPALIVE = Field.create(DATABASE_CONFIG_PREFIX + "tcpKeepAlive")
-            .withDisplayName("TCP keep-alive probe")
-            .withType(Type.BOOLEAN)
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("Enable or disable TCP keep-alive probe to avoid dropping TCP connection")
-            .withValidation(Field::isBoolean);
+                                                            .withDisplayName("TCP keep-alive probe")
+                                                            .withType(Type.BOOLEAN)
+                                                            .withDefault(true)
+                                                            .withWidth(Width.SHORT)
+                                                            .withImportance(Importance.MEDIUM)
+                                                            .withDescription("Enable or disable TCP keep-alive probe to avoid dropping TCP connection")
+                                                            .withValidation(Field::isBoolean);
 
     public static final Field INCLUDE_UNKNOWN_DATATYPES = Field.create("include.unknown.datatypes")
-            .withDisplayName("Include unknown datatypes")
-            .withType(Type.BOOLEAN)
-            .withDefault(false)
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("Specify whether the fields of data type not supported by Debezium should be processed:"
-                    + "'false' (the default) omits the fields; "
-                    + "'true' converts the field into an implementation dependent binary representation.");
+                                                            .withDisplayName("Include unknown datatypes")
+                                                            .withType(Type.BOOLEAN)
+                                                            .withDefault(false)
+                                                            .withWidth(Width.SHORT)
+                                                            .withImportance(Importance.MEDIUM)
+                                                            .withDescription("Specify whether the fields of data type not supported by Debezium should be processed:"
+                                                                    + "'false' (the default) omits the fields; "
+                                                                    + "'true' converts the field into an implementation dependent binary representation.");
 
     public static final Field SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE = Field.create("snapshot.select.statement.overrides")
-            .withDisplayName("List of tables where the default select statement used during snapshotting should be overridden.")
-            .withType(Type.STRING)
-            .withWidth(Width.LONG)
-            .withImportance(Importance.MEDIUM)
-            .withDescription(" This property contains a comma-separated list of fully-qualified tables (DB_NAME.TABLE_NAME). Select statements for the individual tables are " +
-                    "specified in further configuration properties, one for each table, identified by the id 'snapshot.select.statement.overrides.[DB_NAME].[TABLE_NAME]'. " +
-                    "The value of those properties is the select statement to use when retrieving data from the specific table during snapshotting. " +
-                    "A possible use case for large append-only tables is setting a specific point where to start (resume) snapshotting, in case a previous snapshotting was interrupted.");
+                                                            .withDisplayName("List of tables where the default select statement used during snapshotting should be overridden.")
+                                                            .withType(Type.STRING)
+                                                            .withWidth(Width.LONG)
+                                                            .withImportance(Importance.MEDIUM)
+                                                            .withDescription(" This property contains a comma-separated list of fully-qualified tables (DB_NAME.TABLE_NAME). Select statements for the individual tables are " +
+                                                                    "specified in further configuration properties, one for each table, identified by the id 'snapshot.select.statement.overrides.[DB_NAME].[TABLE_NAME]'. " +
+                                                                    "The value of those properties is the select statement to use when retrieving data from the specific table during snapshotting. " +
+                                                                    "A possible use case for large append-only tables is setting a specific point where to start (resume) snapshotting, in case a previous snapshotting was interrupted.");
 
+
+    public static final Field SCHEMA_REFRESH_MODE = Field.create("schema.refresh.mode")
+            .withDisplayName("Schema refresh mode")
+            .withEnum(SchemaRefreshMode.class, SchemaRefreshMode.COLUMNS_DIFF)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("Specify the conditions that trigger a refresh of the in-memory schema for a table. " +
+                    "'columns_diff' (the default) is the safest mode, ensuring the in-memory schema stays in-sync with " +
+                    "the database table's schema at all times. " +
+                    "'columns_diff_exclude_unchanged_toast' instructs the connector to refresh the in-memory schema cache if there is a discrepancy between it " +
+                    "and the schema derived from the incoming message, unless unchanged TOASTable data fully accounts for the discrepancy. " +
+                    "This setting can improve connector performance significantly if there are frequently-updated tables that " +
+                    "have TOASTed data that are rarely part of these updates. However, it is possible for the in-memory schema to " +
+                    "become outdated if TOASTable columns are dropped from the table.");
     /**
      * The set of {@link Field}s defined as part of this configuration.
      */
@@ -714,26 +765,34 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
                                                      SCHEMA_WHITELIST,
                                                      SCHEMA_BLACKLIST, TABLE_WHITELIST, TABLE_BLACKLIST,
                                                      COLUMN_BLACKLIST, SNAPSHOT_MODE,
-                                                     TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE,
+                                                     TIME_PRECISION_MODE, RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE,HSTORE_HANDLING_MODE,
                                                      SSL_MODE, SSL_CLIENT_CERT, SSL_CLIENT_KEY_PASSWORD,
                                                      SSL_ROOT_CERT, SSL_CLIENT_KEY, SNAPSHOT_LOCK_TIMEOUT_MS, ROWS_FETCH_SIZE, SSL_SOCKET_FACTORY,
                                                      STATUS_UPDATE_INTERVAL_MS, TCP_KEEPALIVE, INCLUDE_UNKNOWN_DATATYPES,
-                                                     SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
+                                                     SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE, SCHEMA_REFRESH_MODE, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
 
     private final Configuration config;
     private final TemporalPrecisionMode temporalPrecisionMode;
-    private final DecimalMode decimalHandlingMode;
+    private final HStoreHandlingMode  hStoreHandlingMode;
     private final SnapshotMode snapshotMode;
+    private final SchemaRefreshMode schemaRefreshMode;
+
 
     protected PostgresConnectorConfig(Configuration config) {
-        super(config, getLogicalName(config));
+        super(
+                config,
+                getLogicalName(config),
+                null, // TODO whitelist handling implemented locally here for the time being
+                null
+        );
 
         this.config = config;
         this.temporalPrecisionMode = TemporalPrecisionMode.parse(config.getString(TIME_PRECISION_MODE));
-        String decimalHandlingModeStr = config.getString(PostgresConnectorConfig.DECIMAL_HANDLING_MODE);
-        DecimalHandlingMode decimalHandlingMode = DecimalHandlingMode.parse(decimalHandlingModeStr);
-        this.decimalHandlingMode = decimalHandlingMode.asDecimalMode();
+        String hstoreHandlingModeStr = config.getString(PostgresConnectorConfig.HSTORE_HANDLING_MODE);
+        HStoreHandlingMode hStoreHandlingMode = HStoreHandlingMode.parse(hstoreHandlingModeStr);
+        this.hStoreHandlingMode = hStoreHandlingMode;
         this.snapshotMode = SnapshotMode.parse(config.getString(SNAPSHOT_MODE));
+        this.schemaRefreshMode = SchemaRefreshMode.parse(config.getString(SCHEMA_REFRESH_MODE));
     }
 
     private static String getLogicalName(Configuration config) {
@@ -778,8 +837,8 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
         return temporalPrecisionMode;
     }
 
-    protected DecimalMode decimalHandlingMode() {
-        return decimalHandlingMode;
+    protected HStoreHandlingMode hStoreHandlingMode() {
+        return hStoreHandlingMode;
     }
 
     protected boolean includeUnknownDatatypes() {
@@ -849,6 +908,10 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
         return config.getString(PostgresConnectorConfig.SNAPSHOT_SELECT_STATEMENT_OVERRIDES_BY_TABLE + "." + table);
     }
 
+    protected boolean skipRefreshSchemaOnMissingToastableData() {
+        return SchemaRefreshMode.COLUMNS_DIFF_EXCLUDE_UNCHANGED_TOAST == this.schemaRefreshMode;
+    }
+
     protected static ConfigDef configDef() {
         ConfigDef config = new ConfigDef();
         Field.group(config, "Postgres", SLOT_NAME, PLUGIN_NAME, SERVER_NAME, DATABASE_NAME, HOSTNAME, PORT,
@@ -859,7 +922,8 @@ public class PostgresConnectorConfig extends CommonConnectorConfig {
                     CommonConnectorConfig.TOMBSTONES_ON_DELETE, Heartbeat.HEARTBEAT_INTERVAL,
                     Heartbeat.HEARTBEAT_TOPICS_PREFIX);
         Field.group(config, "Connector", TOPIC_SELECTION_STRATEGY, CommonConnectorConfig.POLL_INTERVAL_MS, CommonConnectorConfig.MAX_BATCH_SIZE, CommonConnectorConfig.MAX_QUEUE_SIZE,
-                    SNAPSHOT_MODE, SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, DECIMAL_HANDLING_MODE, ROWS_FETCH_SIZE);
+                    SNAPSHOT_MODE, SNAPSHOT_LOCK_TIMEOUT_MS, TIME_PRECISION_MODE, RelationalDatabaseConnectorConfig.DECIMAL_HANDLING_MODE, HSTORE_HANDLING_MODE,SCHEMA_REFRESH_MODE,ROWS_FETCH_SIZE);
+
         return config;
     }
 

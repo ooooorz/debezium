@@ -38,6 +38,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import io.debezium.connector.mysql.RecordMakers.RecordsForTable;
 import io.debezium.function.BufferedBlockingConsumer;
 import io.debezium.function.Predicates;
+import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.JdbcConnection.StatementFactory;
 import io.debezium.relational.Column;
@@ -77,7 +78,7 @@ public class SnapshotReader extends AbstractReader {
         this.includeData = context.snapshotMode().includeData();
         this.snapshotLockingMode = context.getConnectorConfig().getSnapshotLockingMode();
         recorder = this::recordRowAsRead;
-        metrics = new SnapshotReaderMetrics(context.getClock(), context.dbSchema());
+        metrics = new SnapshotReaderMetrics(context, context.dbSchema());
     }
 
     /**
@@ -104,7 +105,7 @@ public class SnapshotReader extends AbstractReader {
 
     @Override
     protected void doInitialize() {
-        metrics.register(context, logger);
+        metrics.register(logger);
     }
 
     @Override
@@ -223,7 +224,7 @@ public class SnapshotReader extends AbstractReader {
         boolean isTxnStarted = false;
         boolean tableLocks = false;
         try {
-            metrics.startSnapshot();
+            metrics.snapshotStarted();
 
             // ------
             // STEP 0
@@ -245,7 +246,7 @@ public class SnapshotReader extends AbstractReader {
             mysql.execute(sql.get());
 
             // Generate the DDL statements that set the charset-related system variables ...
-            Map<String, String> systemVariables = connectionContext.readMySqlCharsetSystemVariables(sql);
+            Map<String, String> systemVariables = connectionContext.readMySqlCharsetSystemVariables();
             String setSystemVariablesStatement = connectionContext.setStatementFor(systemVariables);
             AtomicBoolean interrupted = new AtomicBoolean(false);
             long lockAcquired = 0L;
@@ -490,7 +491,7 @@ public class SnapshotReader extends AbstractReader {
 
                     // Dump all of the tables and generate source records ...
                     logger.info("Step {}: scanning contents of {} tables while still in transaction", step, tableIds.size());
-                    metrics.setTableCount(tableIds.size());
+                    metrics.monitoredTablesDetermined(tableIds);
 
                     long startScan = clock.currentTimeInMillis();
                     AtomicLong totalRowCount = new AtomicLong();
@@ -500,6 +501,7 @@ public class SnapshotReader extends AbstractReader {
                     Iterator<TableId> tableIdIter = tableIds.iterator();
                     while (tableIdIter.hasNext()) {
                         TableId tableId = tableIdIter.next();
+                        AtomicLong rowNum = new AtomicLong();
                         if (!isRunning()) break;
 
                         // Obtain a record maker for this table, which knows about the schema ...
@@ -545,7 +547,6 @@ public class SnapshotReader extends AbstractReader {
                             try {
                                 int stepNum = step;
                                 mysql.query(sql.get(), statementFactory, rs -> {
-                                    long rowNum = 0;
                                     try {
                                         // The table is included in the connector's filters, so process all of the table records
                                         // ...
@@ -558,25 +559,25 @@ public class SnapshotReader extends AbstractReader {
                                                 row[i] = readField(rs, j, actualColumn);
                                             }
                                             recorder.recordRow(recordMaker, row, ts); // has no row number!
-                                            ++rowNum;
-                                            if (rowNum % 100 == 0 && !isRunning()) {
+                                            rowNum.incrementAndGet();
+                                            if (rowNum.get() % 100 == 0 && !isRunning()) {
                                                 // We've stopped running ...
                                                 break;
                                             }
-                                            if (rowNum % 10_000 == 0) {
+                                            if (rowNum.get() % 10_000 == 0) {
                                                 long stop = clock.currentTimeInMillis();
                                                 logger.info("Step {}: - {} of {} rows scanned from table '{}' after {}",
                                                             stepNum, rowNum, rowCountStr, tableId, Strings.duration(stop - start));
-                                                metrics.setRowsScanned(tableId.toString(), rowNum);
+                                                metrics.rowsScanned(tableId, rowNum.get());
                                             }
                                         }
 
-                                        totalRowCount.addAndGet(rowNum);
+                                        totalRowCount.addAndGet(rowNum.get());
                                         if (isRunning()) {
                                             long stop = clock.currentTimeInMillis();
                                             logger.info("Step {}: - Completed scanning a total of {} rows from table '{}' after {}",
                                                         stepNum, rowNum, tableId, Strings.duration(stop - start));
-                                            metrics.setRowsScanned(tableId.toString(), rowNum);
+                                            metrics.rowsScanned(tableId, rowNum.get());
                                         }
                                     } catch (InterruptedException e) {
                                         Thread.interrupted();
@@ -585,8 +586,9 @@ public class SnapshotReader extends AbstractReader {
                                         interrupted.set(true);
                                     }
                                 });
-                            } finally {
-                                metrics.completeTable();
+                            }
+                            finally {
+                                metrics.tableSnapshotCompleted(tableId, rowNum.get());
                                 if (interrupted.get()) break;
                             }
                         }
@@ -631,7 +633,7 @@ public class SnapshotReader extends AbstractReader {
                         logger.info("Step {}: rolling back transaction after abort", step++);
                         sql.set("ROLLBACK");
                         mysql.execute(sql.get());
-                        metrics.abortSnapshot();
+                        metrics.snapshotAborted();
                         rolledBack = true;
                     }
                     else {
@@ -639,7 +641,7 @@ public class SnapshotReader extends AbstractReader {
                         logger.info("Step {}: committing transaction", step++);
                         sql.set("COMMIT");
                         mysql.execute(sql.get());
-                        metrics.completeSnapshot();
+                        metrics.snapshotCompleted();
                     }
                 }
 
@@ -683,6 +685,13 @@ public class SnapshotReader extends AbstractReader {
                     // Mark the source as having completed the snapshot. This will ensure the `source` field on records
                     // are not denoted as a snapshot ...
                     source.completeSnapshot();
+                    Heartbeat
+                        .create(
+                                context.config(),
+                                context.topicSelector().getHeartbeatTopic(),
+                                context.getConnectorConfig().getLogicalName()
+                        )
+                        .forcedBeat(source.partition(), source.offset(), this::enqueueRecord);
                 } finally {
                     // Set the completion flag ...
                     completeSuccessfully();
@@ -691,6 +700,21 @@ public class SnapshotReader extends AbstractReader {
                 }
             }
         } catch (Throwable e) {
+            if (isLocked) {
+                try {
+                    sql.set("UNLOCK TABLES");
+                    mysql.execute(sql.get());
+                }
+                catch (Exception eUnlock) {
+                    logger.error("Removing of table locks not completed successfully", eUnlock);
+                }
+                try {
+                    mysql.connection().rollback();
+                }
+                catch (Exception eRollback) {
+                    logger.error("Execption while rollback is executed", eRollback);
+                }
+            }
             failed(e, "Aborting snapshot due to error when last running '" + sql.get() + "': " + e.getMessage());
         }
     }

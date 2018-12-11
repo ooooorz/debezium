@@ -672,7 +672,18 @@ public final class EmbeddedEngine implements Runnable {
                         return;
                     }
                     try {
-                        SourceTaskContext taskContext = () -> offsetReader;
+                        SourceTaskContext taskContext = new SourceTaskContext() {
+                            @Override
+                            public OffsetStorageReader offsetStorageReader() {
+                                return offsetReader;
+                            }
+
+                            @Override
+                            public Map<String, String> configs() {
+                                // TODO Auto-generated method stub
+                                return null;
+                            }
+                        };
                         task.initialize(taskContext);
                         task.start(taskConfigs.get(0));
                         connectorCallback.ifPresent(ConnectorCallback::taskStarted);
@@ -891,7 +902,7 @@ public final class EmbeddedEngine implements Runnable {
 
     @Override
     public String toString() {
-        return "EmbeddedConnector{id=" + config.getString(ENGINE_NAME) + '}';
+        return "EmbeddedEngine{id=" + config.getString(ENGINE_NAME) + '}';
     }
 
     protected static class EmbeddedConfig extends WorkerConfig {

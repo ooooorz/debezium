@@ -9,15 +9,13 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.function.Predicate;
 
-import javax.management.MalformedObjectNameException;
-import javax.management.ObjectName;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.connector.common.CdcSourceTaskContext;
+import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SnapshotMode;
 import io.debezium.function.Predicates;
 import io.debezium.relational.TableId;
@@ -76,7 +74,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
                 : (gtidSetExcludes != null ? Predicates.excludesUuids(gtidSetExcludes) : null);
 
         if (tableIdCaseInsensitive == null) {
-            this.tableIdCaseInsensitive = !"0".equals(connectionContext.readMySqlSystemVariables(null).get(MySqlSystemVariables.LOWER_CASE_TABLE_NAMES));
+            this.tableIdCaseInsensitive = !"0".equals(connectionContext.readMySqlSystemVariables().get(MySqlSystemVariables.LOWER_CASE_TABLE_NAMES));
         } else {
             this.tableIdCaseInsensitive = tableIdCaseInsensitive;
         }
@@ -140,7 +138,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
      */
     public void initializeHistory() {
         // Read the system variables from the MySQL instance and get the current database name ...
-        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables(null);
+        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables();
         String ddlStatement = connectionContext.setStatementFor(variables);
 
         // And write them into the database history ...
@@ -156,7 +154,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
      */
     public void loadHistory(SourceInfo startingPoint) {
         // Read the system variables from the MySQL instance and load them into the DDL parser as defaults ...
-        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables(null);
+        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables();
         dbSchema.setSystemVariables(variables);
 
         // And then load the history ...
@@ -180,7 +178,7 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
      */
     public boolean historyExists() {
         // Read the system variables from the MySQL instance and load them into the DDL parser as defaults ...
-        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables(null);
+        Map<String, String> variables = connectionContext.readMySqlCharsetSystemVariables();
         dbSchema.setSystemVariables(variables);
 
         // And then load the history ...
@@ -282,17 +280,6 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
     }
 
     /**
-     * Create a JMX metric name for the given metric.
-     * @param contextName the name of the context
-     * @return the JMX metric name
-     * @throws MalformedObjectNameException if the name is invalid
-     */
-    public ObjectName metricName(String contextName) throws MalformedObjectNameException {
-        //return new ObjectName("debezium.mysql:type=connector-metrics,connector=" + serverName() + ",name=" + contextName);
-        return new ObjectName("debezium.mysql:type=connector-metrics,context=" + contextName + ",server=" + connectorConfig.getLogicalName());
-    }
-
-    /**
      * Apply the include/exclude GTID source filters to the current {@link #source() GTID set} and merge them onto the
      * currently available GTID set from a MySQL server.
      *
@@ -307,10 +294,11 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
      * This method does not mutate any state in the context.
      *
      * @param availableServerGtidSet the GTID set currently available in the MySQL server
+     * @param purgedServerGtid the GTID set already purged by the MySQL server
      * @return A GTID set meant for consuming from a MySQL binlog; may return null if the SourceInfo has no GTIDs and therefore
      *         none were filtered
      */
-    public GtidSet filterGtidSet(GtidSet availableServerGtidSet) {
+    public GtidSet filterGtidSet(GtidSet availableServerGtidSet, GtidSet purgedServerGtid) {
         String gtidStr = source.gtidSet();
         if (gtidStr == null) {
             return null;
@@ -324,7 +312,20 @@ public final class MySqlTaskContext extends CdcSourceTaskContext {
             LOGGER.info("GTID set after applying GTID source includes/excludes to previous recorded offset: {}", filteredGtidSet);
         }
         LOGGER.info("GTID set available on server: {}", availableServerGtidSet);
-        GtidSet mergedGtidSet = availableServerGtidSet.with(filteredGtidSet);
+
+        GtidSet mergedGtidSet;
+
+        if (connectorConfig.gtidNewChannelPosition() == GtidNewChannelPosition.EARLIEST) {
+            LOGGER.info("Using first available positions for new GTID channels");
+            mergedGtidSet = availableServerGtidSet
+                    .getGtidSetBeginning()
+                    .with(purgedServerGtid)
+                    .with(filteredGtidSet);
+        }
+        else {
+            mergedGtidSet = availableServerGtidSet.with(filteredGtidSet);
+        }
+
         LOGGER.info("Final merged GTID set to use when connecting to MySQL: {}", mergedGtidSet);
         return mergedGtidSet;
     }

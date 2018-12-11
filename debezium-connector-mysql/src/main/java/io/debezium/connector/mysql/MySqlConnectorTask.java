@@ -21,6 +21,7 @@ import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.common.BaseSourceTask;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SnapshotMode;
+import io.debezium.schema.TopicSelector;
 import io.debezium.util.LoggingContext.PreviousContext;
 
 /**
@@ -148,7 +149,7 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                 }
             }
 
-            if (!startWithSnapshot && source.gtidSet() == null && isGtidModeEnabled()) {
+            if (!startWithSnapshot && source.gtidSet() == null && connectionContext.isGtidModeEnabled()) {
                 // The snapshot will properly determine the GTID set, but we're not starting with a snapshot and GTIDs were not
                 // previously used but the MySQL server has them enabled ...
                 source.setCompletedGtidSet("");
@@ -239,7 +240,10 @@ public final class MySqlConnectorTask extends BaseSourceTask {
     @Override
     public synchronized void stop() {
         if (context != null) {
-            PreviousContext prevLoggingContext = this.taskContext.configureLoggingContext("task");
+            PreviousContext prevLoggingContext = null;
+            if (this.taskContext != null) {
+                prevLoggingContext = this.taskContext.configureLoggingContext("task");
+            }
             try {
                 logger.info("Stopping MySQL connector task");
 
@@ -248,7 +252,9 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                     readers.destroy();
                 }
             } finally {
-                prevLoggingContext.restore();
+                if (prevLoggingContext != null) {
+                    prevLoggingContext.restore();
+                }
             }
         }
     }
@@ -318,7 +324,8 @@ public final class MySqlConnectorTask extends BaseSourceTask {
                     logNames.add(rs.getString(1));
                 }
             });
-        } catch (SQLException e) {
+        }
+        catch (SQLException e) {
             throw new ConnectException("Unexpected error while connecting to MySQL and looking for binary logs: ", e);
         }
 
@@ -327,7 +334,10 @@ public final class MySqlConnectorTask extends BaseSourceTask {
         if (!found) {
             logger.info("Connector requires binlog file '{}', but MySQL only has {}", binlogFilename, String.join(", ", logNames));
         }
-        logger.info("MySQL has the binlog file '{}' required by the connector", binlogFilename);
+        else {
+            logger.info("MySQL has the binlog file '{}' required by the connector", binlogFilename);
+        }
+
         return found;
     }
 
@@ -352,26 +362,6 @@ public final class MySqlConnectorTask extends BaseSourceTask {
 
         if (logNames.isEmpty()) return null;
         return logNames.get(0);
-    }
-
-    /**
-     * Determine whether the MySQL server has GTIDs enabled.
-     *
-     * @return {@code false} if the server's {@code gtid_mode} is set and is {@code OFF}, or {@code true} otherwise
-     */
-    protected boolean isGtidModeEnabled() {
-        AtomicReference<String> mode = new AtomicReference<String>("off");
-        try {
-            connectionContext.jdbc().query("SHOW GLOBAL VARIABLES LIKE 'GTID_MODE'", rs -> {
-                if (rs.next()) {
-                    mode.set(rs.getString(1));
-                }
-            });
-        } catch (SQLException e) {
-            throw new ConnectException("Unexpected error while connecting to MySQL and looking at GTID mode: ", e);
-        }
-
-        return !"OFF".equalsIgnoreCase(mode.get());
     }
 
     /**

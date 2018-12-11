@@ -16,8 +16,10 @@ import org.junit.Before;
 import org.junit.Test;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.mysql.MySqlConnectorConfig.GtidNewChannelPosition;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SecureConnectionMode;
 import io.debezium.connector.mysql.MySqlConnectorConfig.SnapshotMode;
+import io.debezium.doc.FixFor;
 import io.debezium.document.Document;
 import io.debezium.relational.history.FileDatabaseHistory;
 import io.debezium.relational.history.HistoryRecord;
@@ -214,6 +216,8 @@ public class MySqlTaskContextTest {
         String availableServerGtidStr = "036d85a9-64e5-11e6-9b48-42010af0000c:1-20,"
                 + "7145bf69-d1ca-11e5-a588-0242ac110004:1-3200,"
                 + "123e4567-e89b-12d3-a456-426655440000:1-41";
+        String purgedServerGtidStr = "";
+
         config = simpleConfig().with(MySqlConnectorConfig.GTID_SOURCE_INCLUDES,
                                      "036d85a9-64e5-11e6-9b48-42010af0000c")
                                .build();
@@ -221,7 +225,7 @@ public class MySqlTaskContextTest {
         context.start();
         context.source().setCompletedGtidSet(gtidStr);
 
-        GtidSet mergedGtidSet = context.filterGtidSet(new GtidSet(availableServerGtidStr));
+        GtidSet mergedGtidSet = context.filterGtidSet(new GtidSet(availableServerGtidStr), new GtidSet(purgedServerGtidStr));
         assertThat(mergedGtidSet).isNotNull();
         GtidSet.UUIDSet uuidSet1 = mergedGtidSet.forServerWithId("036d85a9-64e5-11e6-9b48-42010af0000c");
         GtidSet.UUIDSet uuidSet2 = mergedGtidSet.forServerWithId("7145bf69-d1ca-11e5-a588-0242ac110004");
@@ -231,6 +235,40 @@ public class MySqlTaskContextTest {
         assertThat(uuidSet1.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 2)));
         assertThat(uuidSet2.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 3200)));
         assertThat(uuidSet3.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 41)));
+        assertThat(uuidSet4).isNull();
+    }
+
+    @Test
+    @FixFor("DBZ-923")
+    public void shouldMergeToFirstAvailableGtidSetPositions() throws Exception {
+        String gtidStr = "036d85a9-64e5-11e6-9b48-42010af0000c:1-2,"
+                + "7c1de3f2-3fd2-11e6-9cdc-42010af000bc:5-41";
+
+        String availableServerGtidStr = "036d85a9-64e5-11e6-9b48-42010af0000c:1-20,"
+                + "7145bf69-d1ca-11e5-a588-0242ac110004:1-3200,"
+                + "123e4567-e89b-12d3-a456-426655440000:1-41";
+
+        String purgedServerGtidStr = "7145bf69-d1ca-11e5-a588-0242ac110004:1-1234";
+
+        config = simpleConfig()
+                .with(MySqlConnectorConfig.GTID_SOURCE_INCLUDES, "036d85a9-64e5-11e6-9b48-42010af0000c")
+                .with(MySqlConnectorConfig.GTID_NEW_CHANNEL_POSITION, GtidNewChannelPosition.EARLIEST)
+                .build();
+
+        context = new MySqlTaskContext(config, false);
+        context.start();
+        context.source().setCompletedGtidSet(gtidStr);
+
+        GtidSet mergedGtidSet = context.filterGtidSet(new GtidSet(availableServerGtidStr), new GtidSet(purgedServerGtidStr));
+        assertThat(mergedGtidSet).isNotNull();
+        GtidSet.UUIDSet uuidSet1 = mergedGtidSet.forServerWithId("036d85a9-64e5-11e6-9b48-42010af0000c");
+        GtidSet.UUIDSet uuidSet2 = mergedGtidSet.forServerWithId("7145bf69-d1ca-11e5-a588-0242ac110004");
+        GtidSet.UUIDSet uuidSet3 = mergedGtidSet.forServerWithId("123e4567-e89b-12d3-a456-426655440000");
+        GtidSet.UUIDSet uuidSet4 = mergedGtidSet.forServerWithId("7c1de3f2-3fd2-11e6-9cdc-42010af000bc");
+
+        assertThat(uuidSet1.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 2)));
+        assertThat(uuidSet2.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 1234)));
+        assertThat(uuidSet3.getIntervals()).isEqualTo(Arrays.asList(new GtidSet.Interval(1, 1)));
         assertThat(uuidSet4).isNull();
     }
 

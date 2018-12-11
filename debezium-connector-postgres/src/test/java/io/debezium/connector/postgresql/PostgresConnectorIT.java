@@ -17,7 +17,9 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.sql.SQLException;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -31,6 +33,7 @@ import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.fest.assertions.Assertions;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
@@ -41,6 +44,7 @@ import io.debezium.config.Configuration;
 import io.debezium.config.EnumeratedValue;
 import io.debezium.config.Field;
 import io.debezium.connector.postgresql.PostgresConnectorConfig.LogicalDecoder;
+import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.data.Envelope;
 import io.debezium.data.VerifyRecord;
@@ -149,7 +153,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         validateField(validatedConfig, PostgresConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.ADAPTIVE);
         validateField(validatedConfig, PostgresConnectorConfig.DECIMAL_HANDLING_MODE, PostgresConnectorConfig.DecimalHandlingMode.PRECISE);
         validateField(validatedConfig, PostgresConnectorConfig.SSL_SOCKET_FACTORY, null);
-        validateField(validatedConfig, PostgresConnectorConfig.TCP_KEEPALIVE, null);
+        validateField(validatedConfig, PostgresConnectorConfig.TCP_KEEPALIVE, true);
    }
 
     @Test
@@ -165,7 +169,7 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                 assertThat(error).isInstanceOf(ConnectException.class);
                 Throwable cause = error.getCause();
                 assertThat(cause).isInstanceOf(SQLException.class);
-                assertThat(PSQLState.CONNECTION_REJECTED).isEqualTo(new PSQLState(((SQLException)cause).getSQLState()));
+                assertThat(PSQLState.CONNECTION_REJECTED.getState().equals(((SQLException)cause).getSQLState()));
             }
         });
         if (TestHelper.shouldSSLConnectionFail()) {
@@ -206,6 +210,39 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
         assertConnectorIsRunning();
 
         assertRecordsAfterInsert(2, 3, 3);
+    }
+
+    @Test
+    @FixFor("DBZ-1021")
+    public void shouldIgnoreEventsForDeletedTable() throws Exception {
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                                               .with(PostgresConnectorConfig.SNAPSHOT_MODE, INITIAL.getValue())
+                                               .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE);
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+
+        //check the records from the snapshot
+        assertRecordsFromSnapshot(2, 1, 1);
+
+        // insert 2 new records
+        TestHelper.execute(INSERT_STMT);
+        assertRecordsAfterInsert(2, 2, 2);
+
+        //now stop the connector
+        stopConnector();
+        assertNoRecordsToConsume();
+
+        //insert some more records and deleted the table
+        TestHelper.execute(INSERT_STMT);
+        TestHelper.execute("DROP TABLE s1.a");
+
+        start(PostgresConnector.class, configBuilder.with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE).build());
+        assertConnectorIsRunning();
+
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+        assertThat(actualRecords.topics()).hasSize(1);
+        assertThat(actualRecords.recordsForTopic(topicName("s2.a"))).hasSize(1);
     }
 
     @Test
@@ -408,6 +445,89 @@ public class PostgresConnectorIT extends AbstractConnectorTest {
                              "INSERT INTO s2.a (aa) VALUES (7);";
         TestHelper.execute(insertStmt);
         assertNoRecordsToConsume();
+    }
+
+    @Test
+    @FixFor("DBZ-878")
+    public void shouldReplaceInvalidTopicNameCharacters() throws Exception {
+        String setupStmt = SETUP_TABLES_STMT +
+                           "CREATE TABLE s1.\"dbz_878_some|test@data\" (pk SERIAL, aa integer, PRIMARY KEY(pk));" +
+                           "INSERT INTO s1.\"dbz_878_some|test@data\" (aa) VALUES (123);";
+
+        TestHelper.execute(setupStmt);
+        Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                                                        .with(PostgresConnectorConfig.SNAPSHOT_MODE, INITIAL.getValue())
+                                                        .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                                                        .with(PostgresConnectorConfig.SCHEMA_WHITELIST, "s1")
+                                                        .with(PostgresConnectorConfig.TABLE_WHITELIST, "s1\\.dbz_878_some\\|test@data");
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+
+        SourceRecords actualRecords = consumeRecordsByTopic(1);
+
+        List<SourceRecord> records = actualRecords.recordsForTopic(topicName("s1.dbz_878_some_test_data"));
+        assertThat(records.size()).isEqualTo(1);
+
+        SourceRecord record = records.get(0);
+        VerifyRecord.isValidRead(record, PK_FIELD, 1);
+
+        String sourceTable = ((Struct)record.value()).getStruct("source").getString("table");
+        assertThat(sourceTable).isEqualTo("dbz_878_some|test@data");
+    }
+
+    @Test
+    @FixFor("DBZ-965")
+    public void shouldRegularlyFlushLsn() throws InterruptedException, SQLException {
+        final int recordCount = 10;
+        TestHelper.execute(SETUP_TABLES_STMT);
+        Configuration config = TestHelper.defaultConfig()
+                                         .with(PostgresConnectorConfig.SNAPSHOT_MODE, NEVER.getValue())
+                                         .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.TRUE)
+                                         .with(PostgresConnectorConfig.TABLE_WHITELIST, "s1.a")
+                                         .build();
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+        waitForAvailableRecords(100, TimeUnit.MILLISECONDS);
+        // there shouldn't be any snapshot records
+        assertNoRecordsToConsume();
+
+        final Set<String> flushLsn = new HashSet<>();
+        try (final PostgresConnection connection = TestHelper.create()) {
+            flushLsn.add(getConfirmedFlushLsn(connection));
+            for (int i = 2; i <= recordCount + 2; i++) {
+                TestHelper.execute(INSERT_STMT);
+
+                final SourceRecords actualRecords = consumeRecordsByTopic(1);
+                assertThat(actualRecords.topics().size()).isEqualTo(1);
+                assertThat(actualRecords.recordsForTopic(topicName("s1.a")).size()).isEqualTo(1);
+
+                TimeUnit.MILLISECONDS.sleep(20);
+                flushLsn.add(getConfirmedFlushLsn(connection));
+            }
+        }
+        // Theoretically the LSN should change for each record but in reality there can be
+        // unfrotunate timings so let's suppose the chane will hapeni in 75 % of cases
+        Assertions.assertThat(flushLsn.size()).isGreaterThan((recordCount * 3) / 4);
+    }
+
+    private String getConfirmedFlushLsn(PostgresConnection connection) throws SQLException {
+        return connection.prepareQueryAndMap(
+                "select * from pg_replication_slots where slot_name = ? and database = ? and plugin = ?", statement -> {
+                    statement.setString(1, "debezium");
+                    statement.setString(2, "postgres");
+                    statement.setString(3, TestHelper.decoderPlugin().getPostgresPluginName());
+                },
+                rs -> {
+                    if (rs.next()) {
+                        return rs.getString("confirmed_flush_lsn");
+                    }
+                    else {
+                        fail("No replication slot info available");
+                    }
+                    return null;
+                }
+           );
     }
 
     private void assertFieldAbsent(SourceRecord record, String fieldName) {

@@ -35,6 +35,7 @@ import io.debezium.connector.postgresql.connection.ReplicationConnection;
 import io.debezium.data.Envelope;
 import io.debezium.data.SpecialValueDecimal;
 import io.debezium.function.BlockingConsumer;
+import io.debezium.heartbeat.Heartbeat;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.TableSchema;
@@ -99,7 +100,6 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             streamProducer.ifPresent(producer -> {
                 logger.info("Snapshot finished, continuing streaming changes from {}", ReplicationConnection.format(sourceInfo.lsn()));
                 producer.start(consumer, failureConsumer);
-
             });
         } finally {
             // always cleanup our local data
@@ -163,16 +163,13 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             //now that we have the locks, refresh the schema
             schema.refresh(connection, false);
 
-            // get the current position in the log, from which we'll continue streaming once the snapshot it finished
-            // If rows are being inserted while we're doing the snapshot, the xlog pos should increase and so when
-            // we start streaming, we should get back those changes
             long xlogStart = connection.currentXLogLocation();
             long txId = connection.currentTransactionId().longValue();
             logger.info("\t read xlogStart at '{}' from transaction '{}'", ReplicationConnection.format(xlogStart), txId);
 
             // and mark the start of the snapshot
             sourceInfo.startSnapshot();
-            sourceInfo.update(xlogStart, clock().currentTimeInMicros(), txId);
+            sourceInfo.update(xlogStart, clock().currentTimeInMicros(), txId, null);
 
             logger.info("Step 3: reading and exporting the contents of each table");
             AtomicInteger rowsCounter = new AtomicInteger(0);
@@ -206,6 +203,10 @@ public class RecordsSnapshotProducer extends RecordsProducer {
                 // process and send the last record after marking it as such
                 logger.info("Step 5: sending the last snapshot record");
                 sourceInfo.markLastSnapshotRecord();
+
+                // the sourceInfo element already has been baked into the record value, so
+                // update the "last_snapshot_marker" in there
+                changeSourceToLastSnapshotRecord(currentRecord);
                 this.currentRecord.set(new SourceRecord(currentRecord.sourcePartition(), sourceInfo.offset(),
                                                         currentRecord.topic(), currentRecord.kafkaPartition(),
                                                         currentRecord.keySchema(), currentRecord.key(),
@@ -217,6 +218,18 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             // and complete the snapshot
             sourceInfo.completeSnapshot();
             logger.info("Snapshot completed in '{}'", Strings.duration(clock().currentTimeInMillis() - snapshotStart));
+            Heartbeat
+                .create(
+                    taskContext.config().getConfig(),
+                    taskContext.topicSelector().getHeartbeatTopic(),
+                    taskContext.config().getLogicalName()
+                )
+                .forcedBeat(
+                    sourceInfo.partition(),
+                    sourceInfo.offset(),
+                    r -> consumer.accept(new ChangeEvent(r, sourceInfo.lsn())
+                )
+            );
         }
         catch (SQLException e) {
             rollbackTransaction(jdbcConnection);
@@ -228,6 +241,14 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             rollbackTransaction(jdbcConnection);
 
             logger.warn("Snapshot aborted after '{}'", Strings.duration(clock().currentTimeInMillis() - snapshotStart));
+        }
+    }
+
+    private void changeSourceToLastSnapshotRecord(SourceRecord currentRecord) {
+        final Struct envelope = (Struct)currentRecord.value();
+        final Struct source = (Struct)envelope.get("source");
+        if (source.getBoolean(SourceInfo.LAST_SNAPSHOT_RECORD_KEY) != null) {
+            source.put(SourceInfo.LAST_SNAPSHOT_RECORD_KEY, true);
         }
     }
 
@@ -319,7 +340,7 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             return;
         }
         Schema keySchema = tableSchema.keySchema();
-        sourceInfo.update(clock().currentTimeInMicros());
+        sourceInfo.update(clock().currentTimeInMicros(), tableId);
         Map<String, ?> partition = sourceInfo.partition();
         Map<String, ?> offset = sourceInfo.offset();
         String topicName = topicSelector().topicNameFor(tableId);
@@ -337,7 +358,7 @@ public class RecordsSnapshotProducer extends RecordsProducer {
             logger.debug("sending read event '{}'", record);
         }
         //send the last generated record
-        consumer.accept(new ChangeEvent(record));
+        consumer.accept(new ChangeEvent(record, sourceInfo.lsn()));
     }
 
     /**

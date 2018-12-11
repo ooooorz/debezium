@@ -18,6 +18,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.connector.base.ChangeEventQueue;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.heartbeat.Heartbeat;
+import io.debezium.pipeline.source.spi.DataChangeEventListener;
 import io.debezium.pipeline.spi.ChangeEventCreator;
 import io.debezium.pipeline.spi.ChangeRecordEmitter;
 import io.debezium.pipeline.spi.OffsetContext;
@@ -50,6 +51,7 @@ public class EventDispatcher<T extends DataCollectionId> {
     private final DataCollectionFilter<T> filter;
     private final ChangeEventCreator changeEventCreator;
     private final Heartbeat heartbeat;
+    private DataChangeEventListener eventListener = DataChangeEventListener.NO_OP;
 
     /**
      * Change event receiver for events dispatched from a streaming change event source.
@@ -79,7 +81,7 @@ public class EventDispatcher<T extends DataCollectionId> {
     public void dispatchSnapshotEvent(T dataCollectionId, ChangeRecordEmitter changeRecordEmitter, SnapshotReceiver receiver) throws InterruptedException {
         // TODO Handle Heartbeat
 
-        // TODO Handle JMX
+        eventListener.onEvent();
 
         DataCollectionSchema dataCollectionSchema = schema.schemaFor(dataCollectionId);
 
@@ -103,7 +105,7 @@ public class EventDispatcher<T extends DataCollectionId> {
      * {@link ChangeEventCreator} for converting them into data change events.
      */
     public void dispatchDataChangeEvent(T dataCollectionId, ChangeRecordEmitter changeRecordEmitter) throws InterruptedException {
-        // TODO Handle JMX
+        eventListener.onEvent();
 
         if(!filter.isIncluded(dataCollectionId)) {
             LOGGER.trace("Skipping data change event for {}", dataCollectionId);
@@ -133,6 +135,14 @@ public class EventDispatcher<T extends DataCollectionId> {
         }
 
         schemaChangeEventEmitter.emitSchemaChangeEvent(new SchemaChangeEventReceiver());
+    }
+
+    public void dispatchHeartbeatEvent(OffsetContext offset) throws InterruptedException {
+        heartbeat.forcedBeat(
+                offset.getPartition(),
+                offset.getOffset(),
+                this::enqueueHeartbeat
+        );
     }
 
     private void enqueueHeartbeat(SourceRecord record) throws InterruptedException {
@@ -226,5 +236,14 @@ public class EventDispatcher<T extends DataCollectionId> {
         public void schemaChangeEvent(SchemaChangeEvent event) throws InterruptedException {
             historizedSchema.applySchemaChange(event);
         }
+    }
+
+    /**
+     * Provide a listener that is invoked for every incoming event to be processed.
+     *
+     * @param eventListener
+     */
+    public void setEventListener(DataChangeEventListener eventListener) {
+        this.eventListener = eventListener;
     }
 }
